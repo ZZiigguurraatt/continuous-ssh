@@ -1,0 +1,864 @@
+// Package daemon is the long-lived remote process that owns the spawned
+// command and the per-stream history buffer. The command runs attached to a
+// PTY so that interactive programs (shells, vim, htop, …) behave correctly.
+// stdout and stderr are merged into a single output stream by the PTY itself.
+//
+// Attach connections come and go over a Unix socket; at most one is served at
+// a time (a new attach kicks the previous one).
+package daemon
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"os/signal"
+	"os/user"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/creack/pty"
+
+	"github.com/zziigguurraatt/continuous-ssh/internal/buffer"
+	"github.com/zziigguurraatt/continuous-ssh/internal/chunk"
+	"github.com/zziigguurraatt/continuous-ssh/internal/dlog"
+	"github.com/zziigguurraatt/continuous-ssh/internal/proto"
+)
+
+// Run is the daemon subcommand entry point.
+// Usage: xssh daemon [--debug] --session <id> [--replay]
+// The user's $SHELL (or /etc/passwd, or /bin/sh) is launched as a login
+// shell. With --replay, no shell is started; instead the existing
+// output.log is served to one attaching client and the session dir is
+// removed when the client disconnects.
+func Run(argv []string) int {
+	sessionID, replay, debug, err := parseArgs(argv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
+		return 2
+	}
+	if replay {
+		return ReplayRun(sessionID, debug)
+	}
+
+	sessionDir, err := SessionDir(sessionID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
+		return 1
+	}
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
+		return 1
+	}
+
+	if err := dlog.Setup(filepath.Join(sessionDir, "daemon.log"), debug, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
+		return 1
+	}
+	dlog.E("daemon starting session=%s pid=%d debug=%v", sessionID, os.Getpid(), debug)
+
+	pidPath := filepath.Join(sessionDir, "pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		dlog.E("write pid: %v", err)
+		return 1
+	}
+	infoPath := filepath.Join(sessionDir, "info")
+	_ = os.WriteFile(infoPath, []byte(fmt.Sprintf("started=%s\n", time.Now().Format(time.RFC3339))), 0o600)
+
+	outputBuf, err := buffer.New(filepath.Join(sessionDir, "output.log"), 0, 0, 0)
+	if err != nil {
+		dlog.E("output buffer: %v", err)
+		return 1
+	}
+
+	sockPath := filepath.Join(sessionDir, "sock")
+	_ = os.Remove(sockPath)
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		dlog.E("listen: %v", err)
+		return 1
+	}
+
+	cmd, ptmx, err := buildAndStart()
+	if err != nil {
+		dlog.E("start cmd: %v", err)
+		return 1
+	}
+	dlog.V("cmd started pid=%d argv=%v", cmd.Process.Pid, cmd.Args)
+
+	d := &daemon{
+		sessionID:  sessionID,
+		sessionDir: sessionDir,
+		outputBuf:  outputBuf,
+		ptmx:       ptmx,
+	}
+	d.cond = sync.NewCond(&d.mu)
+
+	d.mu.Lock()
+	d.touchKeepAlive()
+	d.mu.Unlock()
+
+	// Catch SIGTERM/SIGINT/SIGHUP and convert to a clean shutdown.
+	//   - signalShutdown=true so the accept-stopper closes the listener
+	//     (no new attaches) but the active attach can still drain.
+	//   - preserveOnExit=true so the on-disk buffer is kept if there's no
+	//     attach to deliver to.
+	//   - Kill the remote shell, which closes the PTY, which causes
+	//     pumpPTY to seal the buffer, which makes d.exited=true via
+	//     waitCmd → serveAttach's existing exited-path runs the drain +
+	//     EXIT. If that drain succeeds the cleanup notices d.exitDelivered
+	//     and skips the on-disk preservation.
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	go func() {
+		first := true
+		for s := range sigCh {
+			if !first {
+				dlog.E("ignoring signal %v during shutdown", s)
+				continue
+			}
+			first = false
+			dlog.E("SIGHANDLER: received %v, setting signalShutdown=true", s)
+			d.mu.Lock()
+			d.signalShutdown = true
+			d.preserveOnExit = true
+			d.cond.Broadcast()
+			d.mu.Unlock()
+			if cmd.Process != nil {
+				pgid := cmd.Process.Pid
+				err := syscall.Kill(-pgid, syscall.SIGHUP)
+				dlog.E("SIGHANDLER: kill -HUP pgid=%d err=%v", pgid, err)
+			} else {
+				dlog.E("SIGHANDLER: cmd.Process is nil")
+			}
+		}
+	}()
+
+	// One pump drains the PTY master into the buffer. Compared to the old
+	// two-pump (stdout+stderr) design this is simpler: the kernel-side PTY
+	// has already merged the streams for us.
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		d.pumpPTY()
+	}()
+
+	go d.waitCmd(cmd, pumpDone)
+
+	d.acceptLoop(listener)
+
+	d.killCmd(cmd)
+	_ = ptmx.Close()
+	<-pumpDone
+	d.attachesWG.Wait()
+
+	d.mu.Lock()
+	// preserveOnExit is set on signal-induced shutdown and on buffer
+	// overflow. In both cases we keep the on-disk buffer + clean marker
+	// so a later replay can serve it — even when an active client just
+	// received EXIT through the live connection. The active-client case
+	// produces a redundant on-disk copy (the client already has every
+	// byte), but it's a few KB-to-MB and `xssh rm` is right there for
+	// cleanup.
+	preserve := d.preserveOnExit
+	d.mu.Unlock()
+
+	// Close(false) flushes the in-RAM tail to disk; Close(true) just
+	// unlinks the file. Track the close error so we know whether the
+	// preserved file actually contains the full buffer.
+	closeErr := outputBuf.Close(!preserve)
+	_ = listener.Close()
+
+	dlog.E("daemon exit code=%d preserve=%v overflow=%v closeErr=%v",
+		d.exitCode, preserve, d.overflow.Load(), closeErr)
+
+	if preserve {
+		_ = os.Remove(sockPath)
+		_ = os.Remove(pidPath)
+		_ = os.Remove(infoPath)
+		// Write the clean marker ONLY if the RAM tail flushed without
+		// error. A missing marker tells the replay daemon to refuse —
+		// because the on-disk file may be missing the tail.
+		if closeErr == nil {
+			markerPath := filepath.Join(sessionDir, cleanMarkerName)
+			if werr := os.WriteFile(markerPath, nil, 0o600); werr != nil {
+				dlog.E("write clean marker: %v", werr)
+			}
+		} else {
+			dlog.E("not writing clean marker: buffer flush failed")
+		}
+	} else {
+		_ = os.RemoveAll(sessionDir)
+	}
+	return d.exitCode
+}
+
+func parseArgs(argv []string) (string, bool, bool, error) {
+	var sessionID string
+	var debug, replay bool
+	i := 0
+	for i < len(argv) {
+		switch argv[i] {
+		case "--session":
+			if i+1 >= len(argv) {
+				return "", false, false, errors.New("--session requires an argument")
+			}
+			sessionID = argv[i+1]
+			i += 2
+		case "--debug":
+			debug = true
+			i++
+		case "--replay":
+			replay = true
+			i++
+		default:
+			return "", false, false, fmt.Errorf("unknown flag %q", argv[i])
+		}
+	}
+	if sessionID == "" {
+		return "", false, false, errors.New("--session is required")
+	}
+	return sessionID, replay, debug, nil
+}
+
+// buildAndStart launches the user's login shell inside a fresh PTY. The
+// returned *exec.Cmd has its Process populated; the *os.File is the PTY
+// master.
+func buildAndStart() (*exec.Cmd, *os.File, error) {
+	shell := defaultShell()
+	dlog.V("default shell resolved to %q", shell)
+	// Login-shell convention: argv[0] starts with '-'.
+	cmd := &exec.Cmd{
+		Path: shell,
+		Args: []string{"-" + filepath.Base(shell)},
+		Env:  os.Environ(),
+	}
+	// Start with a reasonable default size; the client's first RESIZE frame
+	// (sent right after HELLO_ACK) will replace it with the actual local
+	// terminal dimensions. Starting at 0x0 makes some shells skip prompting.
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: 80, Rows: 24})
+	if err != nil {
+		return nil, nil, fmt.Errorf("pty.Start: %w", err)
+	}
+	return cmd, ptmx, nil
+}
+
+// defaultShell returns the user's preferred shell. SHELL is checked first
+// (covers explicit user overrides), then /etc/passwd (authoritative for the
+// user's login shell, populated by useradd/chsh and used by login(1) and
+// sshd itself), with /bin/sh as a final fallback.
+func defaultShell() string {
+	if s := os.Getenv("SHELL"); s != "" {
+		return s
+	}
+	u, err := user.Current()
+	if err == nil {
+		f, err := os.Open("/etc/passwd")
+		if err == nil {
+			defer f.Close()
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				fields := strings.Split(scanner.Text(), ":")
+				if len(fields) >= 7 && fields[0] == u.Username && fields[6] != "" {
+					return fields[6]
+				}
+			}
+		}
+	}
+	return "/bin/sh"
+}
+
+// SessionDir returns the on-disk directory for a session id.
+func SessionDir(id string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("locate home: %w", err)
+	}
+	return filepath.Join(home, ".continuous-ssh", "sessions", id), nil
+}
+
+type daemon struct {
+	sessionID  string
+	sessionDir string
+
+	outputBuf *buffer.Buffer
+	ptmx      *os.File
+
+	mu   sync.Mutex
+	cond *sync.Cond
+
+	activeConn net.Conn
+	epoch      uint64
+
+	exited   bool
+	exitCode int
+	overflow atomic.Bool
+
+	// shutdown means "tear down immediately, drop the active attach
+	// abruptly". Set by the SHUTDOWN frame (client abort) and by buffer
+	// overflow.
+	shutdown bool
+
+	// signalShutdown means "tear down gracefully: drain the active attach
+	// and send EXIT, *then* clean up". Set by the SIGTERM/SIGINT/SIGHUP
+	// handler. The signal handler also kills the remote shell to drive
+	// pumpPTY → buffer.Seal → d.exited=true, which lets serveAttach's
+	// existing exited-path do the drain+EXIT.
+	signalShutdown bool
+
+	// preserveOnExit means "the user might want to recover this session;
+	// don't delete output.log on the way out". Set on overflow or on
+	// caught SIGTERM/SIGINT/SIGHUP. The cleanup path additionally writes
+	// a `clean` marker file iff the buffer flushed without error — the
+	// replay daemon refuses to serve a session that lacks the marker.
+	// Skipped (no preservation) when exitDelivered is true, because the
+	// client already got everything via the live connection.
+	preserveOnExit bool
+
+	keepAliveUntil time.Time
+	exitDelivered  bool
+
+	attachesWG sync.WaitGroup
+}
+
+// cleanMarkerName is the file written under the session directory when the
+// daemon shuts down cleanly with its RAM tail successfully flushed to
+// disk. The replay daemon refuses to serve a session that lacks it.
+const cleanMarkerName = "clean"
+
+const keepAliveGrace = 30 * time.Second
+
+// touchKeepAlive bumps the keep-alive deadline forward and schedules a
+// broadcast so the accept-stopper wakes when the new deadline elapses.
+// Caller must hold d.mu.
+func (d *daemon) touchKeepAlive() {
+	d.keepAliveUntil = time.Now().Add(keepAliveGrace)
+	time.AfterFunc(keepAliveGrace, func() {
+		d.mu.Lock()
+		d.cond.Broadcast()
+		d.mu.Unlock()
+	})
+}
+
+func (d *daemon) wake() {
+	d.mu.Lock()
+	d.cond.Broadcast()
+	d.mu.Unlock()
+}
+
+func (d *daemon) pumpPTY() {
+	p := make([]byte, 32*1024)
+	for {
+		n, err := d.ptmx.Read(p)
+		if n > 0 {
+			if e := d.outputBuf.Append(p[:n]); e != nil {
+				if errors.Is(e, buffer.ErrOverflow) {
+					dlog.E("output overflow at %d bytes", d.outputBuf.Len())
+					d.overflow.Store(true)
+					d.mu.Lock()
+					d.shutdown = true
+					d.preserveOnExit = true
+					d.cond.Broadcast()
+					d.mu.Unlock()
+				} else {
+					dlog.E("output append: %v", e)
+				}
+				d.outputBuf.Seal()
+				d.wake()
+				return
+			}
+			d.wake()
+		}
+		if err != nil {
+			if err != io.EOF {
+				dlog.V("pty read: %v", err)
+			} else {
+				dlog.V("pty EOF at %d bytes", d.outputBuf.Len())
+			}
+			d.outputBuf.Seal()
+			d.wake()
+			return
+		}
+	}
+}
+
+func (d *daemon) waitCmd(cmd *exec.Cmd, pumpDone <-chan struct{}) {
+	<-pumpDone
+	err := cmd.Wait()
+	code := 0
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			// ExitCode() returns -1 for signal-killed processes. Reconstruct
+			// the shell-convention `128 + signal_number` instead, so the
+			// client can tell signal deaths apart from a normal exit.
+			if ws, ok := ee.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				code = 128 + int(ws.Signal())
+			} else {
+				code = ee.ExitCode()
+			}
+		} else {
+			code = 1
+		}
+	}
+	d.mu.Lock()
+	d.exited = true
+	d.exitCode = code
+	d.cond.Broadcast()
+	d.mu.Unlock()
+	dlog.E("command exited code=%d", code)
+}
+
+func (d *daemon) killCmd(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	// pty.Start sets Setsid → cmd is a session/pgroup leader. Send SIGHUP
+	// to the whole pgroup, then SIGKILL after a grace period.
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGHUP)
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-done
+	}
+}
+
+func (d *daemon) acceptLoop(listener net.Listener) {
+	go func() {
+		d.mu.Lock()
+		for {
+			if d.shutdown || d.signalShutdown {
+				break
+			}
+			if d.exited && d.activeConn == nil {
+				if d.exitDelivered {
+					break
+				}
+				if time.Now().After(d.keepAliveUntil) {
+					break
+				}
+			}
+			d.cond.Wait()
+		}
+		d.mu.Unlock()
+		dlog.V("listener closing")
+		_ = listener.Close()
+	}()
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		d.attachesWG.Add(1)
+		go func(c net.Conn) {
+			defer d.attachesWG.Done()
+			d.serveAttach(c)
+		}(conn)
+	}
+}
+
+func (d *daemon) serveAttach(conn net.Conn) {
+	defer conn.Close()
+	pc := proto.NewConn(conn, conn)
+
+	hf, err := pc.ReadFrame()
+	if err != nil {
+		dlog.E("hello read: %v", err)
+		return
+	}
+	if hf.Type != proto.Hello {
+		dlog.E("expected HELLO got %s", hf.Type)
+		return
+	}
+	hello, err := chunk.DecodeHello(hf.Payload)
+	if err != nil {
+		dlog.E("hello decode: %v", err)
+		return
+	}
+	dlog.V("hello mode=%d sid=%s outputTotal=%d outputChunks=%d",
+		hello.Mode, hello.SessionID, hello.Output.Total, len(hello.Output.Hashes))
+	if hello.Mode == chunk.ModeAttach && hello.SessionID != d.sessionID {
+		dlog.E("session id mismatch want=%s got=%s", d.sessionID, hello.SessionID)
+		return
+	}
+
+	outputMan := manifestOf(d.outputBuf)
+	resendFrom := chunk.ResendFrom(outputMan, hello.Output, d.outputBuf.ChunkSize())
+	// Clamp to the buffer's trim point — bytes below it have been freed
+	// by the ACK-based purge and are no longer readable.
+	if t := d.outputBuf.TrimOffset(); resendFrom < t {
+		resendFrom = t
+	}
+
+	ackPayload, err := (&chunk.Hello{
+		Mode:      chunk.ModeAttach,
+		SessionID: d.sessionID,
+		Output:    outputMan,
+	}).Encode()
+	if err != nil {
+		dlog.E("ack encode: %v", err)
+		return
+	}
+	if err := pc.WriteFrame(proto.Frame{Type: proto.HelloAck, Payload: ackPayload}); err != nil {
+		dlog.E("ack write: %v", err)
+		return
+	}
+
+	d.mu.Lock()
+	if d.activeConn != nil && d.activeConn != conn {
+		_ = d.activeConn.Close()
+	}
+	d.activeConn = conn
+	d.epoch++
+	epoch := d.epoch
+	d.touchKeepAlive()
+	d.cond.Broadcast()
+	d.mu.Unlock()
+	dlog.V("attach epoch=%d resendFrom=%d daemonTotal=%d",
+		epoch, resendFrom, outputMan.Total)
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+
+	var streamerWG sync.WaitGroup
+	streamerWG.Add(1)
+	go func() {
+		defer streamerWG.Done()
+		d.streamLoop(streamCtx, pc, resendFrom)
+	}()
+
+	var stdinWG sync.WaitGroup
+	stdinWG.Add(1)
+	go func() {
+		defer stdinWG.Done()
+		d.readUpstream(pc)
+	}()
+
+	d.mu.Lock()
+	for d.epoch == epoch && !d.shutdown && !d.exited {
+		d.cond.Wait()
+	}
+	superseded := d.epoch != epoch
+	shutdown := d.shutdown
+	exited := d.exited
+	exitCode := d.exitCode
+	d.mu.Unlock()
+
+	switch {
+	case superseded || shutdown:
+		streamCancel()
+		_ = conn.Close()
+		streamerWG.Wait()
+		stdinWG.Wait()
+
+	case exited:
+		// Drain the buffer, then send EXIT. If our signal handler was the
+		// reason the shell died, force the exit code to 129 ("killed by
+		// SIGHUP") so the client can recognize the daemon-stopped case
+		// regardless of how the shell actually handled the signal —
+		// bash, for instance, sometimes catches SIGHUP and exits 0
+		// through its EXIT trap, which would otherwise look identical
+		// to the user typing `exit`.
+		streamerWG.Wait()
+		d.mu.Lock()
+		sigShut := d.signalShutdown
+		d.mu.Unlock()
+		finalCode := exitCode
+		if sigShut {
+			finalCode = 129
+		}
+		dlog.E("EXIT branch: sigShut=%v cmdExitCode=%d finalCode=%d", sigShut, exitCode, finalCode)
+		var p [4]byte
+		binary.BigEndian.PutUint32(p[:], uint32(finalCode))
+		if werr := pc.WriteFrame(proto.Frame{Type: proto.Exit, Payload: p[:]}); werr == nil {
+			d.mu.Lock()
+			d.exitDelivered = true
+			d.cond.Broadcast()
+			d.mu.Unlock()
+			dlog.V("EXIT delivered to attach epoch=%d", epoch)
+		} else {
+			dlog.E("EXIT write failed: %v", werr)
+		}
+		streamCancel()
+		_ = conn.Close()
+		stdinWG.Wait()
+	}
+
+	d.mu.Lock()
+	if d.activeConn == conn {
+		d.activeConn = nil
+	}
+	d.touchKeepAlive()
+	d.cond.Broadcast()
+	d.mu.Unlock()
+}
+
+func (d *daemon) streamLoop(ctx context.Context, pc *proto.Conn, from uint64) {
+	off := from
+	send := make([]byte, 64*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		for {
+			n, err := d.outputBuf.ReadAt(send, off)
+			if n > 0 {
+				if werr := pc.WriteFrame(proto.Frame{Type: proto.Output, Offset: off, Payload: send[:n]}); werr != nil {
+					return
+				}
+				off += uint64(n)
+			}
+			if err == io.EOF {
+				// Drained the buffer up to the current end. Fall through
+				// to WaitFor; only WaitFor knows whether more bytes are
+				// coming or the buffer is sealed for good.
+				break
+			}
+			if err != nil {
+				return
+			}
+			if uint64(n) < uint64(len(send)) {
+				break
+			}
+		}
+		if _, err := d.outputBuf.WaitFor(ctx, off); err != nil {
+			// Sealed (real EOF) or context canceled — done.
+			return
+		}
+	}
+}
+
+func (d *daemon) readUpstream(pc *proto.Conn) {
+	for {
+		f, err := pc.ReadFrame()
+		if err != nil {
+			return
+		}
+		switch f.Type {
+		case proto.Stdin:
+			if _, werr := d.ptmx.Write(f.Payload); werr != nil {
+				dlog.E("pty stdin write: %v", werr)
+				return
+			}
+		case proto.Resize:
+			rp, derr := chunk.DecodeResize(f.Payload)
+			if derr != nil {
+				dlog.E("resize decode: %v", derr)
+				continue
+			}
+			if err := pty.Setsize(d.ptmx, &pty.Winsize{Cols: rp.Cols, Rows: rp.Rows}); err != nil {
+				dlog.E("pty setsize: %v", err)
+			} else {
+				dlog.V("pty resized to %dx%d", rp.Cols, rp.Rows)
+			}
+		case proto.Shutdown:
+			// Client aborted via ~. and asked us to clean up.
+			dlog.E("shutdown requested by client")
+			d.mu.Lock()
+			d.shutdown = true
+			d.cond.Broadcast()
+			d.mu.Unlock()
+			return
+		case proto.Ack:
+			// Client confirms it has received bytes through this offset;
+			// we can free anything older.
+			if len(f.Payload) < 8 {
+				dlog.E("ACK payload too short: %d", len(f.Payload))
+				continue
+			}
+			ackOff := binary.BigEndian.Uint64(f.Payload[:8])
+			d.outputBuf.TrimTo(ackOff)
+			dlog.V("ACK trim to offset %d", ackOff)
+		default:
+			dlog.V("ignoring frame %s from attach", f.Type)
+		}
+	}
+}
+
+func manifestOf(b *buffer.Buffer) chunk.Manifest {
+	return chunk.Manifest{
+		Total:  b.Len(),
+		Hashes: b.ChunkHashes(),
+	}
+}
+
+// ReplayRun serves the contents of a previous session's output.log to one
+// attaching client, then removes the session directory and exits. It is
+// spawned by attach when it finds a stale session directory (output.log
+// present but the regular daemon process is gone — e.g., after a remote
+// reboot or a SIGKILL).
+//
+// Compared to the regular daemon: no PTY, no command, no in-memory buffer,
+// no keep-alive grace. We listen exactly long enough to serve one bridge,
+// stream the file, send EXIT(0), and clean up.
+func ReplayRun(sessionID string, debug bool) int {
+	sessionDir, err := SessionDir(sessionID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "daemon-replay: %v\n", err)
+		return 1
+	}
+	if _, err := os.Stat(sessionDir); err != nil {
+		fmt.Fprintf(os.Stderr, "daemon-replay: session %s: %v\n", sessionID, err)
+		return 1
+	}
+	if err := dlog.Setup(filepath.Join(sessionDir, "daemon.log"), debug, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "daemon-replay: %v\n", err)
+		return 1
+	}
+	dlog.E("replay daemon starting session=%s pid=%d", sessionID, os.Getpid())
+
+	// Check the clean-shutdown marker. Its presence means the previous
+	// daemon flushed its RAM tail to disk successfully on its way out;
+	// its absence means the daemon died abruptly (SIGKILL, OOM, power
+	// loss) and the on-disk file may be missing trailing bytes. In that
+	// case we refuse to replay so the user knows the recovery is
+	// unreliable.
+	markerPath := filepath.Join(sessionDir, cleanMarkerName)
+	_, markerErr := os.Stat(markerPath)
+	cleanShutdown := markerErr == nil
+
+	outputPath := filepath.Join(sessionDir, "output.log")
+	f, err := os.Open(outputPath)
+	if err != nil {
+		dlog.E("open output.log: %v", err)
+		return 1
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		dlog.E("stat output.log: %v", err)
+		return 1
+	}
+	totalSize := uint64(fi.Size())
+	dlog.V("replay totalSize=%d cleanShutdown=%v", totalSize, cleanShutdown)
+
+	sockPath := filepath.Join(sessionDir, "sock")
+	_ = os.Remove(sockPath)
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		dlog.E("listen: %v", err)
+		return 1
+	}
+	defer listener.Close()
+
+	pidPath := filepath.Join(sessionDir, "pid")
+	_ = os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600)
+
+	// One-shot accept: a single attach connects, we serve it, then exit.
+	// Bound the wait so a leftover replay daemon can't linger if attach
+	// never shows up.
+	if uc, ok := listener.(*net.UnixListener); ok {
+		_ = uc.SetDeadline(time.Now().Add(30 * time.Second))
+	}
+	conn, err := listener.Accept()
+	if err != nil {
+		dlog.E("accept: %v", err)
+		_ = os.RemoveAll(sessionDir)
+		return 1
+	}
+	defer conn.Close()
+	_ = listener.Close()
+	dlog.V("attach connected for replay")
+
+	pc := proto.NewConn(conn, conn)
+	hf, err := pc.ReadFrame()
+	if err != nil || hf.Type != proto.Hello {
+		dlog.E("hello read: type=%s err=%v", hf.Type, err)
+		_ = os.RemoveAll(sessionDir)
+		return 1
+	}
+	hello, err := chunk.DecodeHello(hf.Payload)
+	if err != nil {
+		dlog.E("hello decode: %v", err)
+		_ = os.RemoveAll(sessionDir)
+		return 1
+	}
+	dlog.V("replay HELLO clientTotal=%d", hello.Output.Total)
+
+	// Advertise our knowledge of the stream size in the HELLO_ACK. If the
+	// shutdown wasn't clean we report Total = client's own total so that
+	// the chunk-reconciliation diff comes out empty; we'll deliver an
+	// error message and exit instead of replaying.
+	announcedTotal := totalSize
+	if !cleanShutdown {
+		announcedTotal = hello.Output.Total
+	}
+	ackPayload, err := (&chunk.Hello{
+		Mode:      chunk.ModeAttach,
+		SessionID: sessionID,
+		Output:    chunk.Manifest{Total: announcedTotal},
+	}).Encode()
+	if err != nil {
+		dlog.E("ack encode: %v", err)
+		_ = os.RemoveAll(sessionDir)
+		return 1
+	}
+	if err := pc.WriteFrame(proto.Frame{Type: proto.HelloAck, Payload: ackPayload}); err != nil {
+		dlog.E("ack write: %v", err)
+		_ = os.RemoveAll(sessionDir)
+		return 1
+	}
+
+	// Exit codes are the contract with the client:
+	//   129 = the session ended because the remote daemon was stopped
+	//         (clean shutdown, full buffer recovered).
+	//   130 = recovery refused — the previous daemon didn't shut down
+	//         cleanly, so the on-disk buffer is suspect. Left in place
+	//         for manual recovery.
+	// The client interprets these and prints a one-line notice AFTER its
+	// terminal reset, so the message survives alt-screen exit (htop, etc.)
+	// which would otherwise eat any inline OUTPUT-frame notice.
+	exitCode := 0
+	if !cleanShutdown {
+		exitCode = 130
+	} else {
+		// Stream the on-disk content. The client dedups what it already
+		// has against its local buffer via offset.
+		send := make([]byte, 64*1024)
+		var off uint64
+		for off < totalSize {
+			n, rerr := f.ReadAt(send, int64(off))
+			if n > 0 {
+				if werr := pc.WriteFrame(proto.Frame{Type: proto.Output, Offset: off, Payload: send[:n]}); werr != nil {
+					dlog.E("output write: %v", werr)
+					break
+				}
+				off += uint64(n)
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				dlog.E("output read: %v", rerr)
+				break
+			}
+		}
+		dlog.V("replay streamed %d bytes", off)
+		exitCode = 129
+	}
+
+	var ec [4]byte
+	binary.BigEndian.PutUint32(ec[:], uint32(exitCode))
+	_ = pc.WriteFrame(proto.Frame{Type: proto.Exit, Payload: ec[:]})
+
+	_ = conn.Close()
+	if cleanShutdown {
+		_ = os.RemoveAll(sessionDir)
+	}
+	dlog.E("replay daemon exiting code=%d cleanShutdown=%v", exitCode, cleanShutdown)
+	return exitCode
+}

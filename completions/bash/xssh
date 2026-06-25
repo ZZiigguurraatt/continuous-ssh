@@ -1,0 +1,51 @@
+# bash completion for xssh — delegates to ssh's hostname completion so
+# `xssh <TAB>` and `xssh -p 22 <TAB>` etc. behave exactly like `ssh`,
+# pulling hostnames from ~/.ssh/config, ~/.ssh/known_hosts, /etc/hosts,
+# and whatever else the bash-completion package's `_ssh` consults.
+#
+# Install:
+#   System: copy to /usr/share/bash-completion/completions/xssh
+#   User:   copy to ~/.local/share/bash-completion/completions/xssh
+#   Or source from ~/.bashrc:  source /path/to/xssh
+#
+# Requires the `bash-completion` package (Ubuntu: `apt install bash-completion`).
+# Without it the fallback below still gives hostname completion from
+# ~/.ssh/config and known_hosts, just less polished than the real `_ssh`.
+
+_xssh() {
+    # Skip session-management subcommands; no host argument applies.
+    if [ "$COMP_CWORD" -ge 1 ]; then
+        case "${COMP_WORDS[1]}" in
+            ls|kill|rm|help|--help|-h)
+                return
+                ;;
+        esac
+    fi
+
+    # Lazy-load ssh's bash completion if the package supports it
+    # (bash-completion >= 2.0 uses `_completion_loader`).
+    if ! declare -F _ssh >/dev/null 2>&1; then
+        if declare -F _completion_loader >/dev/null 2>&1; then
+            _completion_loader ssh >/dev/null 2>&1
+        fi
+    fi
+
+    if declare -F _ssh >/dev/null 2>&1; then
+        # _ssh reads COMP_WORDS / COMP_CWORD directly; the command name
+        # in COMP_WORDS[0] being "xssh" instead of "ssh" doesn't matter
+        # to it — it just walks the rest of the array.
+        _ssh
+        return
+    fi
+
+    # Fallback when bash-completion isn't installed: complete hostnames
+    # from ~/.ssh/config Host lines (skipping wildcards) and known_hosts.
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local hosts
+    hosts="$( {
+        awk '/^[[:space:]]*Host[[:space:]]/ { for (i=2; i<=NF; i++) if ($i !~ /[*?!]/) print $i }' ~/.ssh/config 2>/dev/null
+        awk -F'[ ,]' '$1 !~ /[|*]/ {print $1}' ~/.ssh/known_hosts 2>/dev/null
+    } | sort -u )"
+    COMPREPLY=( $(compgen -W "$hosts" -- "$cur") )
+}
+complete -F _xssh xssh

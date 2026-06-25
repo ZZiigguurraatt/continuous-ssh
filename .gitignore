@@ -1,0 +1,13 @@
+# Build output — Makefile drops native + cross-compiled binaries here.
+/bin/
+
+# Editor / OS scratch files.
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Go test + coverage artifacts.
+*.test
+*.out
+coverage.txt
