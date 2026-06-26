@@ -11,3 +11,6 @@
 *.test
 *.out
 coverage.txt
+
+# Scratch commit-message file used with `git commit -F commit-message.txt`.
+/commit-message.txt
