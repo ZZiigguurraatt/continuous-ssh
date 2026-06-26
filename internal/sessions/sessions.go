@@ -40,12 +40,15 @@ func (s Status) String() string {
 
 // Session is one session's on-disk + runtime state.
 type Session struct {
-	ID      string
-	Dir     string
-	Status  Status
-	Pid     int
-	Started time.Time
-	Clean   bool // a "clean" marker file is present
+	ID         string
+	Dir        string
+	Status     Status
+	Pid        int
+	Started    time.Time
+	LastAttach time.Time // mtime of the lastattach marker; zero if absent
+	DiskBytes  int64     // sum of output.log.<offset> segment file sizes
+	Clean      bool      // a "clean" marker file is present
+	IsCurrent  bool      // true if XSSH_SESSION env var matches this session
 }
 
 // List enumerates every session directory under ~/.continuous-ssh/sessions/.
@@ -73,6 +76,8 @@ func List() ([]Session, error) {
 		s := Session{ID: e.Name(), Dir: filepath.Join(root, e.Name())}
 		s.Pid = readPid(s.Dir)
 		s.Started = readStarted(s.Dir)
+		s.LastAttach = mtimeOrZero(filepath.Join(s.Dir, "lastattach"))
+		s.DiskBytes = sumSegmentSizes(s.Dir)
 		if _, err := os.Stat(filepath.Join(s.Dir, "clean")); err == nil {
 			s.Clean = true
 		}
@@ -94,6 +99,17 @@ func List() ([]Session, error) {
 		}
 		return out[i].Started.Before(out[j].Started)
 	})
+	// Mark "current" session — the one this process is running inside.
+	// The daemon exports XSSH_SESSION=<id> into the spawned shell's env,
+	// so child processes (like `xssh ls`) inherit it.
+	if cur := os.Getenv("XSSH_SESSION"); cur != "" {
+		for i := range out {
+			if out[i].ID == cur {
+				out[i].IsCurrent = true
+				break
+			}
+		}
+	}
 	return out, nil
 }
 
@@ -147,12 +163,24 @@ func connectedSocks() map[string]bool {
 }
 
 // Render produces a human-readable table of sessions, one per line.
+//
+// Column layout:
+//
+//	[*] SESSION ID  STATUS  PID    DISK BUF  LAST CHANGE  STARTED
+//
+// The leading `*` marks the session this process is running inside
+// (XSSH_SESSION env var match), if any. LAST CHANGE encodes both the
+// kind of the most recent state-change event and how long ago it
+// happened — "connected Xm" for an active session (still attached
+// since X ago) or "disconnected Xm ago" for stale/dead (without a
+// client since X ago).
 func Render(sessions []Session, w *os.File) {
 	if len(sessions) == 0 {
 		fmt.Fprintln(w, "(no sessions)")
 		return
 	}
-	fmt.Fprintf(w, "%-34s  %-7s  %-7s  %s\n", "SESSION ID", "STATUS", "PID", "STARTED")
+	fmt.Fprintf(w, "%-2s%-34s  %-7s  %-7s  %-10s  %-22s   %s\n",
+		"", "SESSION ID", "STATUS", "PID", "DISK BUF", "LAST CHANGE", "STARTED")
 	now := time.Now()
 	for _, s := range sessions {
 		pid := "-"
@@ -161,10 +189,108 @@ func Render(sessions []Session, w *os.File) {
 		}
 		started := "-"
 		if !s.Started.IsZero() {
-			d := now.Sub(s.Started).Truncate(time.Second)
-			started = fmt.Sprintf("%s (%s ago)", s.Started.Format("2006-01-02 15:04"), d)
+			ago := humanDur(now.Sub(s.Started))
+			// %3s right-justifies short durations so the unit char
+			// lines up vertically across rows ("12m" / " 5m" / "44m"),
+			// without the extra leading space that %4s would add for
+			// 3-char durations (the common case).
+			started = fmt.Sprintf("%s (%3s ago)", s.Started.Format("2006-01-02 15:04"), ago)
 		}
-		fmt.Fprintf(w, "%-34s  %-7s  %-7s  %s\n", s.ID, s.Status, pid, started)
+		change := "-"
+		if !s.LastAttach.IsZero() {
+			ago := humanDur(now.Sub(s.LastAttach))
+			verb := "connected"
+			if s.Status != StatusActive {
+				verb = "disconnected"
+			}
+			// Verb padded to "disconnected" width; the time portion
+			// is wrapped in parens with a single space separator,
+			// matching STARTED's "<prefix> (X ago)" pattern.
+			// Duration right-justified to 3 chars so the unit chars
+			// line up vertically across rows.
+			change = fmt.Sprintf("%-12s (%3s ago)", verb, ago)
+		}
+		marker := ""
+		if s.IsCurrent {
+			marker = "* "
+		} else {
+			marker = "  "
+		}
+		fmt.Fprintf(w, "%s%-34s  %-7s  %-7s  %-10s  %-22s   %s\n",
+			marker, s.ID, s.Status, pid, humanBytes(s.DiskBytes), change, started)
+	}
+}
+
+// mtimeOrZero returns the mtime of the file at path, or the zero time
+// if it can't be stat'd.
+func mtimeOrZero(path string) time.Time {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}
+	}
+	return fi.ModTime()
+}
+
+// sumSegmentSizes adds up the bytes of every output.log.<digits> file
+// under dir. The disk-spill buffer is segmented (see internal/buffer
+// for the format); we don't need the buffer package here — a simple
+// pattern match on filenames does the job.
+func sumSegmentSizes(dir string) int64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, e := range entries {
+		name := e.Name()
+		rem, ok := strings.CutPrefix(name, "output.log.")
+		if !ok || rem == "" {
+			continue
+		}
+		if _, err := strconv.ParseUint(rem, 10, 64); err != nil {
+			continue
+		}
+		if fi, err := e.Info(); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
+}
+
+// humanBytes formats a byte count as a short string ("0", "512 B",
+// "3.2 KB", "5.0 MB", "1.2 GB"). Decimal units, one fractional digit.
+func humanBytes(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+	const k = 1024
+	switch {
+	case n < k:
+		return fmt.Sprintf("%d B", n)
+	case n < k*k:
+		return fmt.Sprintf("%.1f KB", float64(n)/k)
+	case n < k*k*k:
+		return fmt.Sprintf("%.1f MB", float64(n)/(k*k))
+	default:
+		return fmt.Sprintf("%.1f GB", float64(n)/(k*k*k))
+	}
+}
+
+// humanDur formats a duration as "1d", "3h", "12m", "47s" — coarsest
+// non-zero unit only. Caller appends " ago" or similar.
+func humanDur(d time.Duration) string {
+	if d < time.Second {
+		return "0s"
+	}
+	switch {
+	case d >= 24*time.Hour:
+		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
+	case d >= time.Hour:
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	case d >= time.Minute:
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	default:
+		return fmt.Sprintf("%ds", int(d/time.Second))
 	}
 }
 

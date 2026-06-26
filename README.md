@@ -524,11 +524,32 @@ List every session directory under `~/.continuous-ssh/sessions/`:
 
 ```
 $ xssh ls
-SESSION ID                          STATUS   PID      STARTED
-ab12cd34ef56...                     active   12345    2026-06-25 14:02 (12m ago)
-98fe76dc54ba...                     stale    12380    2026-06-25 14:09 (5m ago)
-deadc0de8765...                     dead     -        2026-06-25 13:30 (44m ago)
+  SESSION ID                          STATUS   PID      DISK BUF    LAST CHANGE              STARTED
+* ab12cd34ef56789012ab34cd56ef7890    active   12345    0           connected    (12m ago)   2026-06-25 14:02 (12m ago)
+  98fe76dc54ba32108765edcb432109af    stale    12380    21.0 MB     disconnected ( 5m ago)   2026-06-25 14:09 ( 5m ago)
+  deadc0de87654321fedcba0987654321    dead     -        100.0 MB    disconnected (44m ago)   2026-06-25 13:30 (44m ago)
 ```
+
+Columns:
+
+- **Leading `*`**: marks the session this command is being run inside,
+  if any. Detected via the `XSSH_SESSION` environment variable that the
+  daemon exports into the spawned shell.
+- **SESSION ID**: directory name under `~/.continuous-ssh/sessions/`.
+- **STATUS**: see table below.
+- **PID**: daemon PID, or `-` for dead sessions.
+- **DISK BUF**: total bytes across all `output.log.<offset>` segment
+  files. Normally `0` for a healthy active session (RAM tail isn't
+  exceeded). Grows during a disconnect; shrinks again on reconnect as
+  ACKs trim segments away.
+- **LAST CHANGE**: the most recent attach/detach event and how long
+  ago it happened. `connected (X ago)` for an active session means
+  the current client connected X ago and is still attached;
+  `disconnected (X ago)` for stale or dead means the session has been
+  without a client for that long. The same `(X ago)` parenthesised
+  style as the STARTED column.
+- **STARTED**: absolute timestamp + relative age of the session
+  directory.
 
 Statuses:
 

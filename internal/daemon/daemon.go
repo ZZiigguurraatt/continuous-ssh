@@ -89,7 +89,7 @@ func Run(argv []string) int {
 		return 1
 	}
 
-	cmd, ptmx, err := buildAndStart()
+	cmd, ptmx, err := buildAndStart(sessionID)
 	if err != nil {
 		dlog.E("start cmd: %v", err)
 		return 1
@@ -276,15 +276,17 @@ func parseArgs(argv []string) (string, bool, bool, error) {
 
 // buildAndStart launches the user's login shell inside a fresh PTY. The
 // returned *exec.Cmd has its Process populated; the *os.File is the PTY
-// master.
-func buildAndStart() (*exec.Cmd, *os.File, error) {
+// master. The shell's environment gets XSSH_SESSION=<id> so processes
+// inside the session (notably `xssh ls`) can detect which xssh session
+// they're running under.
+func buildAndStart(sessionID string) (*exec.Cmd, *os.File, error) {
 	shell := defaultShell()
 	dlog.V("default shell resolved to %q", shell)
 	// Login-shell convention: argv[0] starts with '-'.
 	cmd := &exec.Cmd{
 		Path: shell,
 		Args: []string{"-" + filepath.Base(shell)},
-		Env:  os.Environ(),
+		Env:  append(os.Environ(), "XSSH_SESSION="+sessionID),
 	}
 	// Start with a reasonable default size; the client's first RESIZE frame
 	// (sent right after HELLO_ACK) will replace it with the actual local
@@ -393,6 +395,13 @@ const cleanMarkerName = "clean"
 // client can print a more specific message.
 const overflowMarkerName = "overflow"
 
+// lastAttachName is the file whose mtime tracks the most recent
+// attach or detach event. `xssh ls` displays "X ago" relative to it
+// so users can see how long a stale session has been without a
+// client (or, for an active session, how long the current client
+// has been connected).
+const lastAttachName = "lastattach"
+
 const keepAliveGrace = 30 * time.Second
 
 // stdinChCapacity is how many Stdin frames the ptmx writer can have
@@ -412,6 +421,19 @@ func (d *daemon) touchKeepAlive() {
 		d.cond.Broadcast()
 		d.mu.Unlock()
 	})
+}
+
+// touchLastAttach updates the mtime of the lastattach marker file
+// to "now". Called on each attach/detach event so `xssh ls` can show
+// how long ago a stale session lost its client. Caller doesn't need
+// any particular lock — the file's mtime is the only thing observed.
+func (d *daemon) touchLastAttach() {
+	path := filepath.Join(d.sessionDir, lastAttachName)
+	now := time.Now()
+	if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+		_ = f.Close()
+	}
+	_ = os.Chtimes(path, now, now)
 }
 
 func (d *daemon) wake() {
@@ -647,6 +669,7 @@ func (d *daemon) serveAttach(conn net.Conn) {
 	d.activeConn = conn
 	d.epoch++
 	epoch := d.epoch
+	d.touchLastAttach()
 	d.touchKeepAlive()
 	d.cond.Broadcast()
 	d.mu.Unlock()
@@ -724,6 +747,7 @@ func (d *daemon) serveAttach(conn net.Conn) {
 		d.activeConn = nil
 	}
 	d.touchKeepAlive()
+	d.touchLastAttach()
 	d.cond.Broadcast()
 	d.mu.Unlock()
 }
