@@ -310,27 +310,35 @@ then on, `~.` is the only way out.
 
 ## Debug mode
 
-`--debug` enables verbose logging:
+Three verbosity levels, controlled by three mutually-exclusive flags
+on the client. The level is propagated through the chain (client →
+remote attach → daemon) automatically.
 
-- Client → a **per-invocation** file under
-  `~/.continuous-ssh/clients/<date>-<target>-<pid>.log` (so concurrent or
-  back-to-back invocations don't interleave), and mirrored to stderr
-  (CR-LF translated to stay readable in raw mode).
+| Level | Flag | What's logged |
+|-------|------|--------------|
+| 0 (default) | (none) | Errors and event messages only — start/exit lines, signals, overflow notices. A few lines per session. |
+| 1 (verbose) | `--debug` | Above + session-level events: protocol negotiation, reconnects, ACK trims as a whole, signal handlers, buffer-state heartbeat every 10 s. Tens of lines per session. Also mirrors the log to stderr (CR-LF translated so it stays readable while the local terminal is in raw mode). |
+| 1 (verbose) | `--debug-file` | Same level as `--debug`, but no stderr mirror. The log path is printed to stderr once on startup so you can `tail -f` it from another shell. |
+| 2 (trace) | `--trace-file` | Above + per-frame chatter: every OUT/IN frame, every ACK sent, overlap drops. Thousands of lines per session under load. File-only (no stderr mirror — would flood the terminal). |
+
+Log files:
+
+- Client → `~/.continuous-ssh/clients/<date>-<target>-<pid>.log` (one
+  file per invocation, so concurrent or back-to-back invocations
+  don't interleave their output; only created when a debug/trace
+  flag is set).
 - Attach → `~/.continuous-ssh/sessions/<id>/attach.log` (file only —
   stderr would surface to the user terminal via ssh).
 - Daemon → `~/.continuous-ssh/sessions/<id>/daemon.log` (file only).
 
-`--debug-file` is identical to `--debug` except the stderr mirror is
-suppressed; the per-invocation path is printed to stderr once on
-startup so you can `tail -f` it from another shell.
+ssh's own stderr (normally discarded) is captured into the
+per-invocation client log when any debug/trace flag is set — useful
+when diagnosing ssh-layer issues like authentication failures.
 
-The flag is propagated through the chain automatically. ssh's own stderr
-(normally discarded) is captured into the per-invocation client log when
-`--debug` is set, which is the most useful single place to look when a
-connection is misbehaving.
-
-Without `--debug`, the same files are written to but contain only error
-lines.
+Without any debug/trace flag the remote attach/daemon log files are
+still created but contain only error/event lines (the daemon-side
+files live inside the session directory which gets cleaned up when
+the session ends, so they don't accumulate).
 
 ## Reconnect behaviour
 

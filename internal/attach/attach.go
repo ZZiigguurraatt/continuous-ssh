@@ -27,12 +27,12 @@ import (
 
 // Run is the attach subcommand entry point.
 //
-//	xssh attach [--debug] --new
-//	xssh attach [--debug] --session <id>
+//	xssh attach [--debug | --trace] --new
+//	xssh attach [--debug | --trace] --session <id>
 //
 // In --new mode the daemon launches the user's login shell.
 func Run(argv []string) int {
-	newMode, sessionID, debug, err := parseArgs(argv)
+	newMode, sessionID, logLevel, err := parseArgs(argv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "attach: %v\n", err)
 		return 2
@@ -60,11 +60,11 @@ func Run(argv []string) int {
 	// attach must NEVER mirror logs to its own stderr — that stderr is wired
 	// back to the user's terminal via ssh, which would break the silence
 	// guarantee. File-only.
-	_ = dlog.Setup(filepath.Join(sd, "attach.log"), debug, nil)
-	dlog.E("attach starting session=%s newMode=%v debug=%v pid=%d", sessionID, newMode, debug, os.Getpid())
+	_ = dlog.Setup(filepath.Join(sd, "attach.log"), logLevel, nil)
+	dlog.E("attach starting session=%s newMode=%v level=%d pid=%d", sessionID, newMode, logLevel, os.Getpid())
 
 	if newMode {
-		if err := spawnDaemon(sessionID, debug); err != nil {
+		if err := spawnDaemon(sessionID, logLevel); err != nil {
 			dlog.E("spawn daemon: %v", err)
 			return 1
 		}
@@ -91,7 +91,7 @@ func Run(argv []string) int {
 		segs, segErr := buffer.ScanSegments(filepath.Join(sd, "output.log"))
 		if segErr == nil && len(segs) > 0 {
 			dlog.V("dial failed (%v); %d segment(s) present, spawning replay daemon", err, len(segs))
-			if serr := spawnReplayDaemon(sessionID, debug); serr != nil {
+			if serr := spawnReplayDaemon(sessionID, logLevel); serr != nil {
 				dlog.E("spawn replay daemon: %v", serr)
 				return 1
 			}
@@ -110,15 +110,13 @@ func Run(argv []string) int {
 	return bridge(conn)
 }
 
-func spawnReplayDaemon(sessionID string, debug bool) error {
+func spawnReplayDaemon(sessionID string, logLevel int) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate self: %w", err)
 	}
 	args := []string{"daemon", "--session", sessionID, "--replay"}
-	if debug {
-		args = append(args, "--debug")
-	}
+	args = append(args, logLevelFlags(logLevel)...)
 	cmd := exec.Command(self, args...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
@@ -131,7 +129,9 @@ func spawnReplayDaemon(sessionID string, debug bool) error {
 	return nil
 }
 
-func parseArgs(argv []string) (newMode bool, sessionID string, debug bool, err error) {
+// parseArgs returns (newMode, sessionID, logLevel, err).
+func parseArgs(argv []string) (newMode bool, sessionID string, logLevel int, err error) {
+	logLevel = dlog.LevelError
 	i := 0
 	for i < len(argv) {
 		switch argv[i] {
@@ -139,22 +139,27 @@ func parseArgs(argv []string) (newMode bool, sessionID string, debug bool, err e
 			newMode = true
 			i++
 		case "--debug":
-			debug = true
+			if logLevel < dlog.LevelVerbose {
+				logLevel = dlog.LevelVerbose
+			}
+			i++
+		case "--trace":
+			logLevel = dlog.LevelTrace
 			i++
 		case "--session":
 			if i+1 >= len(argv) {
-				return false, "", false, errors.New("--session requires an argument")
+				return false, "", 0, errors.New("--session requires an argument")
 			}
 			sessionID = argv[i+1]
 			i += 2
 		default:
-			return false, "", false, fmt.Errorf("unknown flag %q", argv[i])
+			return false, "", 0, fmt.Errorf("unknown flag %q", argv[i])
 		}
 	}
 	if newMode == (sessionID != "") {
-		return false, "", false, errors.New("exactly one of --new or --session is required")
+		return false, "", 0, errors.New("exactly one of --new or --session is required")
 	}
-	return newMode, sessionID, debug, nil
+	return newMode, sessionID, logLevel, nil
 }
 
 func generateSessionID() (string, error) {
@@ -165,15 +170,27 @@ func generateSessionID() (string, error) {
 	return hex.EncodeToString(buf[:]), nil
 }
 
-func spawnDaemon(sessionID string, debug bool) error {
+// logLevelFlags returns the CLI flag(s) corresponding to a dlog level
+// that get appended to a spawned subprocess's argv. Level 0 emits
+// nothing; level 1 emits --debug; level 2 emits --trace.
+func logLevelFlags(level int) []string {
+	switch level {
+	case dlog.LevelTrace:
+		return []string{"--trace"}
+	case dlog.LevelVerbose:
+		return []string{"--debug"}
+	default:
+		return nil
+	}
+}
+
+func spawnDaemon(sessionID string, logLevel int) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate self: %w", err)
 	}
 	args := []string{"daemon", "--session", sessionID}
-	if debug {
-		args = append(args, "--debug")
-	}
+	args = append(args, logLevelFlags(logLevel)...)
 	cmd := exec.Command(self, args...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil

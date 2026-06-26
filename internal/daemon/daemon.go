@@ -42,13 +42,13 @@ import (
 // output.log is served to one attaching client and the session dir is
 // removed when the client disconnects.
 func Run(argv []string) int {
-	sessionID, replay, debug, err := parseArgs(argv)
+	sessionID, replay, logLevel, err := parseArgs(argv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
 		return 2
 	}
 	if replay {
-		return ReplayRun(sessionID, debug)
+		return ReplayRun(sessionID, logLevel)
 	}
 
 	sessionDir, err := SessionDir(sessionID)
@@ -61,11 +61,11 @@ func Run(argv []string) int {
 		return 1
 	}
 
-	if err := dlog.Setup(filepath.Join(sessionDir, "daemon.log"), debug, nil); err != nil {
+	if err := dlog.Setup(filepath.Join(sessionDir, "daemon.log"), logLevel, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "daemon: %v\n", err)
 		return 1
 	}
-	dlog.E("daemon starting session=%s pid=%d debug=%v", sessionID, os.Getpid(), debug)
+	dlog.E("daemon starting session=%s pid=%d level=%d", sessionID, os.Getpid(), logLevel)
 
 	pidPath := filepath.Join(sessionDir, "pid")
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
@@ -246,32 +246,40 @@ func Run(argv []string) int {
 	return d.exitCode
 }
 
-func parseArgs(argv []string) (string, bool, bool, error) {
+// parseArgs returns (sessionID, replay, logLevel, err). logLevel maps
+// to dlog levels: 0=errors only, 1=verbose, 2=trace.
+func parseArgs(argv []string) (string, bool, int, error) {
 	var sessionID string
-	var debug, replay bool
+	var replay bool
+	logLevel := dlog.LevelError
 	i := 0
 	for i < len(argv) {
 		switch argv[i] {
 		case "--session":
 			if i+1 >= len(argv) {
-				return "", false, false, errors.New("--session requires an argument")
+				return "", false, 0, errors.New("--session requires an argument")
 			}
 			sessionID = argv[i+1]
 			i += 2
 		case "--debug":
-			debug = true
+			if logLevel < dlog.LevelVerbose {
+				logLevel = dlog.LevelVerbose
+			}
+			i++
+		case "--trace":
+			logLevel = dlog.LevelTrace
 			i++
 		case "--replay":
 			replay = true
 			i++
 		default:
-			return "", false, false, fmt.Errorf("unknown flag %q", argv[i])
+			return "", false, 0, fmt.Errorf("unknown flag %q", argv[i])
 		}
 	}
 	if sessionID == "" {
-		return "", false, false, errors.New("--session is required")
+		return "", false, 0, errors.New("--session is required")
 	}
-	return sessionID, replay, debug, nil
+	return sessionID, replay, logLevel, nil
 }
 
 // buildAndStart launches the user's login shell inside a fresh PTY. The
@@ -764,7 +772,7 @@ func (d *daemon) streamLoop(ctx context.Context, pc *proto.Conn, from uint64) {
 		for {
 			n, err := d.outputBuf.ReadAt(send, off)
 			if n > 0 {
-				dlog.V("OUT off=%d n=%d firstBytes=%q", off, n, firstFew(send[:n], 16))
+				dlog.T("OUT off=%d n=%d firstBytes=%q", off, n, firstFew(send[:n], 16))
 				if werr := pc.WriteFrame(proto.Frame{Type: proto.Output, Offset: off, Payload: send[:n]}); werr != nil {
 					return
 				}
@@ -837,7 +845,7 @@ func (d *daemon) readUpstream(pc *proto.Conn) {
 			}
 			ackOff := binary.BigEndian.Uint64(f.Payload[:8])
 			d.outputBuf.TrimTo(ackOff)
-			dlog.V("ACK trim to offset %d", ackOff)
+			dlog.T("ACK trim to offset %d", ackOff)
 		default:
 			dlog.V("ignoring frame %s from attach", f.Type)
 		}
@@ -920,7 +928,7 @@ func streamSegments(pc *proto.Conn, segs []buffer.SegmentInfo, from uint64, send
 // Compared to the regular daemon: no PTY, no command, no in-memory buffer,
 // no keep-alive grace. We listen exactly long enough to serve one bridge,
 // stream the file, send EXIT(0), and clean up.
-func ReplayRun(sessionID string, debug bool) int {
+func ReplayRun(sessionID string, logLevel int) int {
 	sessionDir, err := SessionDir(sessionID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "daemon-replay: %v\n", err)
@@ -930,7 +938,7 @@ func ReplayRun(sessionID string, debug bool) int {
 		fmt.Fprintf(os.Stderr, "daemon-replay: session %s: %v\n", sessionID, err)
 		return 1
 	}
-	if err := dlog.Setup(filepath.Join(sessionDir, "daemon.log"), debug, nil); err != nil {
+	if err := dlog.Setup(filepath.Join(sessionDir, "daemon.log"), logLevel, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "daemon-replay: %v\n", err)
 		return 1
 	}

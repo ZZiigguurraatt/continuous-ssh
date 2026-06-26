@@ -39,7 +39,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `xssh — continuous-ssh: interactive SSH that survives disconnects.
 
 Usage:
-  xssh [--debug | --debug-file] [ssh-args...] <target>
+  xssh [--debug | --debug-file | --trace-file] [ssh-args...] <target>
 
 The remote always runs your login shell. ssh-args (flags + target) are
 forwarded verbatim to the system ssh binary. On disconnect the wrapper
@@ -52,10 +52,13 @@ Flags:
                 mirrored to stderr (CR-LF translated in raw mode).
                 Propagated to the remote attach and daemon. ssh's own
                 stderr is captured into the log instead of being discarded.
-  --debug-file  same as --debug but file-only — no stderr mirror. Keeps
-                the terminal clean while still recording everything to
-                the log, including the daemon-side buffer-stats heartbeat
-                (every 10s). Prints the log path on startup.
+  --debug-file  same level as --debug but file-only — no stderr mirror.
+                Prints the log path on startup so you can tail it from
+                another shell.
+  --trace-file  bumps the log level: also captures per-frame chatter
+                (OUT/IN frames, every ACK sent, overlap drops). Always
+                file-only — would flood the terminal otherwise. High
+                volume: thousands of lines per session under load.
 
 Key sequences (at start of line):
   ~.   abort and exit

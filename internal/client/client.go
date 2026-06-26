@@ -28,15 +28,17 @@ import (
 	"github.com/zziigguurraatt/continuous-ssh/internal/proto"
 )
 
-// Run is the client entry point. argv excludes the program name. Anything
-// other than our own `--debug` / `--debug-file` flag is forwarded to `ssh`
-// as arguments. The remote always runs the user's login shell.
+// Run is the client entry point. argv excludes the program name.
+// Anything other than our own `--debug` / `--debug-file` / `--trace-file`
+// flags is forwarded to `ssh` as arguments. The remote always runs the
+// user's login shell.
 func Run(argv []string) int {
-	sshArgs, debug, debugFile, err := parseArgs(argv)
+	sshArgs, logLevel, mirrorStderr, err := parseArgs(argv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "continuous-ssh: %v\n", err)
 		return 2
 	}
+	debug := logLevel >= dlog.LevelVerbose
 
 	stdinFd := int(os.Stdin.Fd())
 	if !term.IsTerminal(stdinFd) {
@@ -45,9 +47,9 @@ func Run(argv []string) int {
 	}
 
 	// Only create a per-invocation log file when the user explicitly
-	// asks for logging. Without --debug/--debug-file, dlog.Setup with
-	// an empty path falls through to io.Discard — no file, no clutter
-	// in ~/.continuous-ssh/clients/.
+	// asks for logging. Without --debug/--debug-file/--trace-file,
+	// dlog.Setup with an empty path falls through to io.Discard — no
+	// file, no clutter in ~/.continuous-ssh/clients/.
 	var logPath string
 	if debug {
 		p, perr := clientLogPath(sshArgs)
@@ -56,20 +58,19 @@ func Run(argv []string) int {
 			logPath = p
 		}
 	}
-	// --debug mirrors verbose logging to stderr; --debug-file routes
-	// the same verbose logging only to the file, leaving the terminal
-	// clean. Both turn on verbose mode and both propagate to the
-	// remote attach (where dlog is always file-only anyway).
+	// stderr mirror only when explicitly asked (--debug). Trace mode
+	// would flood the terminal; file-only flags route everything to
+	// the log file.
 	var stderrSink io.Writer
-	if debug && !debugFile {
+	if mirrorStderr {
 		stderrSink = dlog.CRLFWriter{W: os.Stderr}
 	}
-	_ = dlog.Setup(logPath, debug, stderrSink)
-	dlog.E("client starting debug=%v debugFile=%v sshArgs=%v", debug, debugFile, sshArgs)
-	// In --debug-file mode the user has no terminal mirror to tell
-	// them where the log went. Print the path once on startup so they
-	// can `tail -f` it from another shell.
-	if debug && debugFile && logPath != "" {
+	_ = dlog.Setup(logPath, logLevel, stderrSink)
+	dlog.E("client starting level=%d sshArgs=%v", logLevel, sshArgs)
+	// In file-only modes (--debug-file / --trace-file) the user has no
+	// terminal mirror to tell them where the log went. Print the path
+	// once on startup so they can `tail -f` it from another shell.
+	if debug && !mirrorStderr && logPath != "" {
 		fmt.Fprintf(os.Stderr, "continuous-ssh: logging to %s\n", logPath)
 	}
 
@@ -87,6 +88,7 @@ func Run(argv []string) int {
 	c := &client{
 		sshArgs:   sshArgs,
 		debug:     debug,
+		logLevel:  logLevel,
 		outputBuf: outputBuf,
 		stdinFd:   stdinFd,
 		termOut:   &crlfTranslator{w: os.Stdout},
@@ -196,39 +198,44 @@ func Run(argv []string) int {
 	return code
 }
 
-// parseArgs splits the client argv into (ssh-args, debug, debugFile).
+// parseArgs splits the client argv into (ssh-args, logLevel, mirrorStderr).
 //
 // Grammar:
 //
-//	xssh [--debug | --debug-file] [ssh-args...]
+//	xssh [--debug | --debug-file | --trace-file] [ssh-args...]
 //
-// --debug      enables verbose logging to a per-invocation file
+// --debug       enables verbose logging to a per-invocation file
+//               under ~/.continuous-ssh/clients/<date>-<target>-<pid>.log
+//               AND mirrors to stderr (CR-LF-translated in raw mode).
 //
-//	under ~/.continuous-ssh/clients/<date>-<target>-<pid>.log
-//	AND mirrors to stderr (CR-LF-translated in raw mode).
+// --debug-file  same level (verbose) but file-only — no stderr mirror.
+//               The log path is printed to stderr once on startup so
+//               you can `tail -f` it from another shell.
 //
-// --debug-file is the same but file-only — no stderr mirror. The
-//
-//	log path is printed to stderr once on startup so you can
-//	tail it from another shell.
+// --trace-file  bumps to trace level — file gains per-frame chatter
+//               (OUT/IN frames, every ACK sent). High volume. Always
+//               file-only; trace would flood the terminal.
 //
 // Every other argv element is forwarded to `ssh` verbatim.
-func parseArgs(argv []string) (sshArgs []string, debug, debugFile bool, err error) {
+func parseArgs(argv []string) (sshArgs []string, logLevel int, mirrorStderr bool, err error) {
+	logLevel = dlog.LevelError
 	for _, t := range argv {
 		switch t {
 		case "--debug":
-			debug = true
+			logLevel = dlog.LevelVerbose
+			mirrorStderr = true
 		case "--debug-file":
-			debug = true
-			debugFile = true
+			logLevel = dlog.LevelVerbose
+		case "--trace-file":
+			logLevel = dlog.LevelTrace
 		default:
 			sshArgs = append(sshArgs, t)
 		}
 	}
 	if len(sshArgs) == 0 {
-		return nil, false, false, errors.New("ssh target required")
+		return nil, 0, false, errors.New("ssh target required")
 	}
-	return sshArgs, debug, debugFile, nil
+	return sshArgs, logLevel, mirrorStderr, nil
 }
 
 // clientLogPath builds a per-invocation log path under
@@ -297,7 +304,8 @@ func sanitizeForFilename(s string) string {
 
 type client struct {
 	sshArgs   []string
-	debug     bool
+	debug     bool // true when logLevel >= LevelVerbose (kept for terse checks)
+	logLevel  int  // dlog.LevelError / LevelVerbose / LevelTrace
 	sessionID string
 	outputBuf *buffer.Buffer
 
@@ -723,7 +731,13 @@ func (c *client) makeSSHCmd(first bool) *exec.Cmd {
 		shellQuote("xssh"),
 		shellQuote("attach"),
 	}
-	if c.debug {
+	// Forward the verbosity level to the remote. The remote dlog is
+	// always file-only (no stderr mirror — ssh's stderr surfaces to
+	// the user's terminal) regardless of which flag was used locally.
+	switch c.logLevel {
+	case dlog.LevelTrace:
+		tokens = append(tokens, shellQuote("--trace"))
+	case dlog.LevelVerbose:
 		tokens = append(tokens, shellQuote("--debug"))
 	}
 	if first {
@@ -821,10 +835,10 @@ func (c *client) handleOutputFrame(f proto.Frame) {
 	payload := f.Payload
 	total := c.outputBuf.Len()
 
-	dlog.V("IN  off=%d len=%d total=%d firstBytes=%q", off, len(payload), total, firstFewBytes(payload, 16))
+	dlog.T("IN  off=%d len=%d total=%d firstBytes=%q", off, len(payload), total, firstFewBytes(payload, 16))
 
 	if off+uint64(len(payload)) <= total {
-		dlog.V("output overlap: off=%d len=%d total=%d (skipped)", off, len(payload), total)
+		dlog.T("output overlap: off=%d len=%d total=%d (skipped)", off, len(payload), total)
 		return
 	}
 	if off > total {
@@ -882,7 +896,7 @@ func (c *client) tryAck(minBytes uint64) {
 		dlog.V("ack write: %v", err)
 		return
 	}
-	dlog.V("ACK sent at offset %d", total)
+	dlog.T("ACK sent at offset %d", total)
 }
 
 // watchAckIdle wakes once per ackIdleMax and fires an ACK if any bytes
