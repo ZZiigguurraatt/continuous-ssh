@@ -581,6 +581,43 @@ The two-step idiom — politely end first, GC later — is
 `xssh kill --active` followed at some later point by `xssh rm --dead`.
 The one-step shortcut for the same effect is `xssh rm --kill --active`.
 
+## Protocol versioning
+
+The wire protocol carried inside the SSH transport has an explicit
+`major.minor` version exchanged in HELLO/HELLO_ACK at session start.
+Initial version is **`1.0`** (see `ProtocolMajor`/`ProtocolMinor` in
+`internal/proto/frame.go`).
+
+Compatibility rule:
+
+- **Same major** → compatible. Minor differences are accepted
+  silently; the session proceeds normally. With `--debug` or
+  `--debug-file` on, both sides log a one-line note (`protocol
+  negotiated: local=X.Y remote=A.B` on match, or `protocol minor
+  differs: …` when minors differ).
+- **Different major** → fatal. Client prints:
+  ```
+  continuous-ssh: incompatible protocol (local=X.Y, remote=A.B).
+  Re-deploy the matching xssh binary to the remote.
+  ```
+  and exits with status **132**. The reconnect retry loop is skipped
+  — no amount of retrying fixes a mismatched binary.
+
+When to bump which:
+
+- **Major** (`1.0` → `2.0`): wire-format changes, removed or
+  semantically-changed frame types, or any change that breaks how
+  the peer interprets existing frames. Forces re-deploying both
+  sides.
+- **Minor** (`1.0` → `1.1`): additive backward-compatible changes —
+  new optional frame types, new exit codes the peer can safely
+  ignore, new fields appended at the end of an existing payload.
+
+Both sides check on receive. On mismatch the daemon still sends back
+HELLO_ACK with its own version (so the client can read the daemon's
+version and include both numbers in the error message), then closes
+the connection without setting up any streams.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -589,6 +626,7 @@ The one-step shortcut for the same effect is `xssh rm --kill --active`.
 | `129`| Remote daemon was stopped by signal (signal-induced shutdown, or successful replay of a signal-preserved session). Client prints `continuous-ssh: remote daemon stopped.` |
 | `130`| User aborted with `~.` (prints `Connection aborted.`), **or** replay was refused because the previous daemon didn't shut down cleanly (prints the "not cleanly shut down" message above). |
 | `131`| Remote daemon stopped because its held output buffer hit the 100 MiB cap (typically a long disconnect with fast output). Buffer was preserved and replayed successfully. Client prints `continuous-ssh: remote daemon stopped because its output buffer filled (long disconnect with fast output).` |
+| `132`| Protocol-version mismatch between local and remote xssh binaries. Client prints `continuous-ssh: incompatible protocol (local=X.Y, remote=A.B). Re-deploy the matching xssh binary to the remote.` Major-version differences are fatal; same-major minor differences are accepted silently. |
 | other| Underlying ssh / command exit code, passed through. |
 
 ## Smoke tests

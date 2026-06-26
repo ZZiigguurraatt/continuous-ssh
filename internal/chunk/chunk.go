@@ -16,6 +16,7 @@ import (
 	"fmt"
 
 	"github.com/zziigguurraatt/continuous-ssh/internal/buffer"
+	"github.com/zziigguurraatt/continuous-ssh/internal/proto"
 )
 
 type Mode uint8
@@ -32,19 +33,34 @@ type Manifest struct {
 }
 
 // Hello is the structured payload of a HELLO or HELLO_ACK frame.
+//
+// Major/Minor at the start let either side detect protocol-incompatible
+// peers. DecodeHello populates them as-received; the caller is
+// responsible for checking against proto.ProtocolMajor/Minor and
+// deciding whether to proceed.
 type Hello struct {
+	Major     uint8
+	Minor     uint8
 	Mode      Mode
 	SessionID string
 	Output    Manifest
 }
 
-const helloVersion = 2
-
 func (h *Hello) Encode() ([]byte, error) {
 	if len(h.SessionID) > 255 {
 		return nil, fmt.Errorf("chunk: session id too long: %d", len(h.SessionID))
 	}
-	payload := []byte{helloVersion, byte(h.Mode), byte(len(h.SessionID))}
+	major := h.Major
+	if major == 0 {
+		major = proto.ProtocolMajor
+	}
+	minor := h.Minor
+	if minor == 0 && h.Major == 0 {
+		// Only default minor when major also defaulted; an explicit
+		// major with minor=0 should stay minor=0.
+		minor = proto.ProtocolMinor
+	}
+	payload := []byte{major, minor, byte(h.Mode), byte(len(h.SessionID))}
 	payload = append(payload, []byte(h.SessionID)...)
 	if uint64(len(h.Output.Hashes))*buffer.DefaultChunkSize > h.Output.Total {
 		return nil, fmt.Errorf("chunk: hash count exceeds total bytes")
@@ -59,16 +75,22 @@ func (h *Hello) Encode() ([]byte, error) {
 	return payload, nil
 }
 
+// DecodeHello parses a HELLO/HELLO_ACK payload. It does NOT enforce
+// protocol-version compatibility — Major/Minor are returned as-is and
+// the caller decides what to do with them. This lets the daemon read
+// a mismatched client's HELLO and still send back its own version in
+// HELLO_ACK so the client can surface a clear error.
 func DecodeHello(p []byte) (*Hello, error) {
-	if len(p) < 3 {
+	if len(p) < 4 {
 		return nil, errors.New("chunk: hello payload too short")
 	}
-	if p[0] != helloVersion {
-		return nil, fmt.Errorf("chunk: unsupported hello version %d", p[0])
+	h := &Hello{
+		Major: p[0],
+		Minor: p[1],
+		Mode:  Mode(p[2]),
 	}
-	h := &Hello{Mode: Mode(p[1])}
-	sidLen := int(p[2])
-	p = p[3:]
+	sidLen := int(p[3])
+	p = p[4:]
 	if len(p) < sidLen {
 		return nil, errors.New("chunk: hello session id truncated")
 	}

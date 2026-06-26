@@ -161,6 +161,9 @@ func Run(argv []string) int {
 			msg = "continuous-ssh: session was not cleanly shut down; recovery aborted."
 		case 131:
 			msg = "continuous-ssh: remote daemon stopped because its output buffer filled (long disconnect with fast output)."
+		case 132:
+			msg = fmt.Sprintf("continuous-ssh: incompatible protocol (local=%d.%d, remote=%d.%d). Re-deploy the matching xssh binary to the remote.",
+				proto.ProtocolMajor, proto.ProtocolMinor, c.remoteMajor, c.remoteMinor)
 		}
 		if msg != "" {
 			// Emit a bare CR (no LF) before the message: returns the
@@ -321,6 +324,11 @@ type client struct {
 	// (size trigger) and watchAckIdle (time trigger).
 	ackMu        sync.Mutex
 	ackedThrough uint64
+
+	// remoteMajor/Minor are populated on protocol-version mismatch so
+	// the post-exit message in Run can name both sides' versions.
+	remoteMajor uint8
+	remoteMinor uint8
 
 	// altScanner watches the remote's output for alt-screen-buffer
 	// enter/exit escape sequences so we know whether we're currently in
@@ -565,6 +573,26 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		c.killSSH(sshCmd)
 		stderrWG.Wait()
 		return runResult{}
+	}
+	// Protocol-version check. Major mismatch is fatal — there's no
+	// point retrying because the remote binary is what needs replacing.
+	// We surface this to the user via exit code 132 + a clear message
+	// (see post-exit switch in Run).
+	if ackHello.Major != proto.ProtocolMajor {
+		dlog.E("protocol mismatch: remote=%d.%d local=%d.%d",
+			ackHello.Major, ackHello.Minor, proto.ProtocolMajor, proto.ProtocolMinor)
+		c.remoteMajor = ackHello.Major
+		c.remoteMinor = ackHello.Minor
+		c.killSSH(sshCmd)
+		stderrWG.Wait()
+		return runResult{exit: true, exitCode: 132}
+	}
+	if ackHello.Minor != proto.ProtocolMinor {
+		dlog.V("protocol minor differs: remote=%d.%d local=%d.%d (compatible)",
+			ackHello.Major, ackHello.Minor, proto.ProtocolMajor, proto.ProtocolMinor)
+	} else {
+		dlog.V("protocol negotiated: local=%d.%d remote=%d.%d",
+			proto.ProtocolMajor, proto.ProtocolMinor, ackHello.Major, ackHello.Minor)
 	}
 	if c.sessionID == "" {
 		c.sessionID = ackHello.SessionID

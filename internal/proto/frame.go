@@ -55,6 +55,23 @@ const (
 	MaxPayloadSize = 64 << 20
 )
 
+// Protocol version. Sent as `[u8 major][u8 minor]` at the start of every
+// HELLO and HELLO_ACK payload.
+//
+// Compatibility rule:
+//   - Same major → compatible. Minor differences are accepted silently
+//     (and logged only when --debug/--debug-file is on). Bump minor for
+//     additive, backward-compatible changes (new optional frame types,
+//     new exit codes the peer can safely ignore, etc.).
+//   - Different major → fatal. The receiver prints a user-facing
+//     message and exits with code 132. Bump major for wire-format
+//     changes or any change that breaks how the peer interprets
+//     existing frames.
+const (
+	ProtocolMajor uint8 = 1
+	ProtocolMinor uint8 = 0
+)
+
 type Frame struct {
 	Type    FrameType
 	Offset  uint64

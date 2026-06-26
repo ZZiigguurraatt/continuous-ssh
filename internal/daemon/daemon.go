@@ -590,9 +590,23 @@ func (d *daemon) serveAttach(conn net.Conn) {
 		dlog.E("hello decode: %v", err)
 		return
 	}
-	dlog.V("hello mode=%d sid=%s outputTotal=%d outputChunks=%d",
-		hello.Mode, hello.SessionID, hello.Output.Total, len(hello.Output.Hashes))
-	if hello.Mode == chunk.ModeAttach && hello.SessionID != d.sessionID {
+	dlog.V("hello proto=%d.%d mode=%d sid=%s outputTotal=%d outputChunks=%d",
+		hello.Major, hello.Minor, hello.Mode, hello.SessionID,
+		hello.Output.Total, len(hello.Output.Hashes))
+
+	// Protocol-version check. We always send HELLO_ACK back so the
+	// client can see our version too — but on major mismatch we close
+	// the conn right after, refusing to set up a stream.
+	majorMismatch := hello.Major != proto.ProtocolMajor
+	if majorMismatch {
+		dlog.E("protocol mismatch: client=%d.%d local=%d.%d",
+			hello.Major, hello.Minor, proto.ProtocolMajor, proto.ProtocolMinor)
+	} else if hello.Minor != proto.ProtocolMinor {
+		dlog.V("protocol minor differs: client=%d.%d local=%d.%d",
+			hello.Major, hello.Minor, proto.ProtocolMajor, proto.ProtocolMinor)
+	}
+
+	if !majorMismatch && hello.Mode == chunk.ModeAttach && hello.SessionID != d.sessionID {
 		dlog.E("session id mismatch want=%s got=%s", d.sessionID, hello.SessionID)
 		return
 	}
@@ -616,6 +630,13 @@ func (d *daemon) serveAttach(conn net.Conn) {
 	}
 	if err := pc.WriteFrame(proto.Frame{Type: proto.HelloAck, Payload: ackPayload}); err != nil {
 		dlog.E("ack write: %v", err)
+		return
+	}
+
+	// After advertising our version, bail on major mismatch. The client
+	// will see our HELLO_ACK, detect the mismatch on its side, and
+	// surface a clear message to the user.
+	if majorMismatch {
 		return
 	}
 
