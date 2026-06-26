@@ -1073,12 +1073,24 @@ func ReplayRun(sessionID string, logLevel int) int {
 
 	var ec [4]byte
 	binary.BigEndian.PutUint32(ec[:], uint32(exitCode))
-	_ = pc.WriteFrame(proto.Frame{Type: proto.Exit, Payload: ec[:]})
+	exitDelivered := pc.WriteFrame(proto.Frame{Type: proto.Exit, Payload: ec[:]}) == nil
 
 	_ = conn.Close()
-	if cleanShutdown {
+	// Only clean up the session dir when the replay actually completed
+	// end-to-end: a successful stream (129 or 131) AND a successful
+	// EXIT-frame delivery. If anything went wrong (mid-stream network
+	// drop → exitCode=1, or EXIT write failed silently because the
+	// link was already dead), leave the segments + clean marker in
+	// place so a subsequent reconnect can spawn a fresh replay daemon
+	// and resume from where the client got to. The client's
+	// outputBuf.Len() advances monotonically across attempts, so each
+	// retry covers strictly less ground until the buffered output is
+	// fully delivered.
+	streamSucceeded := exitCode == 129 || exitCode == 131
+	if cleanShutdown && streamSucceeded && exitDelivered {
 		_ = os.RemoveAll(sessionDir)
 	}
-	dlog.E("replay daemon exiting code=%d cleanShutdown=%v", exitCode, cleanShutdown)
+	dlog.E("replay daemon exiting code=%d cleanShutdown=%v streamSucceeded=%v exitDelivered=%v",
+		exitCode, cleanShutdown, streamSucceeded, exitDelivered)
 	return exitCode
 }
