@@ -312,16 +312,22 @@ then on, `~.` is the only way out.
 
 `--debug` enables verbose logging:
 
-- Client → `~/.continuous-ssh/client.log` and mirrored to stderr (CR-LF
-  translated to stay readable in raw mode).
+- Client → a **per-invocation** file under
+  `~/.continuous-ssh/clients/<date>-<target>-<pid>.log` (so concurrent or
+  back-to-back invocations don't interleave), and mirrored to stderr
+  (CR-LF translated to stay readable in raw mode).
 - Attach → `~/.continuous-ssh/sessions/<id>/attach.log` (file only —
   stderr would surface to the user terminal via ssh).
 - Daemon → `~/.continuous-ssh/sessions/<id>/daemon.log` (file only).
 
+`--debug-file` is identical to `--debug` except the stderr mirror is
+suppressed; the per-invocation path is printed to stderr once on
+startup so you can `tail -f` it from another shell.
+
 The flag is propagated through the chain automatically. ssh's own stderr
-(normally discarded) is captured into `client.log` when `--debug` is set,
-which is the most useful single place to look when a connection is
-misbehaving.
+(normally discarded) is captured into the per-invocation client log when
+`--debug` is set, which is the most useful single place to look when a
+connection is misbehaving.
 
 Without `--debug`, the same files are written to but contain only error
 lines.
@@ -374,13 +380,16 @@ keeps growing as new chunks are completed, so the manifest sent in
 A monotonic byte counter (`outputBuf.Len()`) tracks the cumulative
 total received.
 
-**Daemon side: 10 MiB RAM tail + disk spill.** The daemon holds
-unacked output: the newest 10 MiB in RAM, the rest in
-`~/.continuous-ssh/sessions/<id>/output.log` on disk. Hard cap is
-100 MiB of **unacked** held bytes; the daemon trims as the client
-acknowledges, so the cap is really "how much output can pile up
-during a single disconnect" not "how much output the session can
-produce in total".
+**Daemon side: 10 MiB RAM tail + segmented disk spill.** The daemon
+holds unacked output: the newest 10 MiB in RAM, the rest spilled to
+a sequence of 10 MiB segment files in
+`~/.continuous-ssh/sessions/<id>/output.log.<startOff>`. As ACKs
+arrive, `TrimTo(N)` deletes any segment whose entire range falls
+below N — so disk usage tracks *held* bytes, not cumulative output.
+Hard cap is 100 MiB of **unacked** held bytes; the daemon trims as
+the client acknowledges, so the cap is really "how much output can
+pile up during a single disconnect" not "how much output the session
+can produce in total".
 
 **ACK-based purge during a healthy connection.** As the client
 displays output it sends `Ack(N)` frames back to the daemon (where N
@@ -433,7 +442,8 @@ visible in one place.
 | Parameter | Value | Defined in | What it controls |
 |-----------|-------|------------|------------------|
 | `DefaultMaxBytes` | **100 MiB** | `internal/buffer/buffer.go` | Daemon's hard cap on **held** (unacked) bytes. Exceeded → daemon exits, session goes to disk for replay. |
-| `DefaultRAMTail` | **10 MiB** | `internal/buffer/buffer.go` | Daemon's in-RAM window; older held bytes spill to `output.log`. |
+| `DefaultRAMTail` | **10 MiB** | `internal/buffer/buffer.go` | Daemon's in-RAM window; older held bytes spill to segment files. |
+| `DefaultSegmentSize` | **10 MiB** | `internal/buffer/buffer.go` | Size of each on-disk segment file. Rotated when full; deleted when fully trimmed by ACKs. |
 | `clientBufRAM` | **10 MiB** | `internal/client/client.go` | Client's RAM-only sliding window; older bytes drop off the back (local terminal scrollback is the real history). |
 | `DefaultChunkSize` | **1 MiB** | `internal/buffer/buffer.go` | Granularity of SHA-256 chunk hashes and the "always resend last complete chunk" rule for ragged-edge reconnects. |
 | `ackInterval` | **5 MiB** | `internal/client/client.go` | Size trigger — client emits an ACK after this many newly-displayed bytes since the last ACK. |
@@ -452,7 +462,9 @@ For each live session the daemon keeps state under
 sock          Unix socket the daemon listens on
 pid           daemon PID
 info          session metadata (start time)
-output.log    disk spill — the on-disk half of the output buffer
+output.log.<off>  disk spill — one or more 10 MiB segment files, deleted as
+              ACKs advance past their end. Each name encodes the byte
+              offset of its first byte (zero-padded to 20 digits).
 daemon.log   daemon log file
 attach.log   attach log file
 clean         written only when the daemon shut down with a complete flush
@@ -466,9 +478,9 @@ exiting, and (for the signal case) on whether a client is connected:
 | Remote shell exits cleanly (`exit`) | Whole directory removed. |
 | Client sends `SHUTDOWN` (user hit `~.`) | Whole directory removed. |
 | `SIGTERM`/`SIGINT`/`SIGHUP` *with* an active client | Daemon kills the remote shell, drains the buffer to the client, sends `EXIT(129)`. Client exits cleanly. Whole directory removed — the client has everything. |
-| `SIGTERM`/`SIGINT`/`SIGHUP` *without* an active client | RAM tail flushed to disk; `sock`/`pid`/`info` removed; `output.log` + `clean` marker kept for the next reconnect to replay. |
+| `SIGTERM`/`SIGINT`/`SIGHUP` *without* an active client | RAM tail flushed to a fresh segment; `sock`/`pid`/`info` removed; segment files + `clean` marker kept for the next reconnect to replay. |
 | Output buffer overflows (>100 MiB unacked) | Preserved like the no-client signal case. |
-| Hard kill (`SIGKILL`, OOM, power loss) | Daemon never gets to flush. `output.log` is whatever spilled before death; **no `clean` marker** is written. |
+| Hard kill (`SIGKILL`, OOM, power loss) | Daemon never gets to flush. Segments are whatever spilled before death; **no `clean` marker** is written. |
 
 ## Recovery / replay
 
@@ -489,7 +501,8 @@ continuous-ssh: session was not cleanly shut down; recovery aborted.
 ```
 
 The on-disk buffer is *left in place* in that case so you can grab it
-by hand (e.g. `scp host:~/.continuous-ssh/sessions/<id>/output.log .`).
+by hand (e.g. `scp -r host:~/.continuous-ssh/sessions/<id> .` —
+segment files concatenate in name order to reconstruct the stream).
 
 When replay succeeds (clean marker present), the client prints:
 
@@ -576,6 +589,90 @@ The one-step shortcut for the same effect is `xssh rm --kill --active`.
 | `129`| Remote daemon was stopped (signal-induced shutdown, or successful replay of a preserved session). Client prints `continuous-ssh: remote daemon stopped.` |
 | `130`| User aborted with `~.` (prints `Connection aborted.`), **or** replay was refused because the previous daemon didn't shut down cleanly (prints the "not cleanly shut down" message above). |
 | other| Underlying ssh / command exit code, passed through. |
+
+## Smoke tests
+
+Two end-to-end scenarios exercise every buffer code path. `seq` is the
+sole output generator — its output is predictable (you can see exactly
+where if it ever stops) and one tool covers both tests.
+
+**Test A — reconnect + reconcile (session continues)**
+
+```
+xssh user@host
+# inside the session:
+sleep 20; seq 1 5000000          # ~36 MiB once seq starts
+```
+
+The `sleep 20` gives you 20 s to switch to another shell and stage
+the disable-network + `pkill` commands so they're ready to run the
+moment `seq` starts. While `seq` is running, from **another local
+shell**, do these four steps in order:
+
+1. **Disable networking to the remote** (toggle WiFi off, `nmcli`,
+   `iptables`, whatever's fastest).
+2. **Kill the ssh subprocess**:
+   ```
+   pkill -P $(pgrep xssh) ssh
+   ```
+3. Wait 5–10 seconds (the daemon keeps producing into its buffer
+   during this window; client's reconnect attempts fail because the
+   network is down).
+4. **Re-enable networking.**
+
+The next reconnect attempt succeeds. The client sends `HELLO` with
+its current chunk-hash manifest; the daemon compares and retransmits
+everything from the first divergent chunk onward (plus the trailing
+chunk, always). `seq`'s output should pick up where it left off and
+complete with the final number visible.
+
+Exercises: first spill (`total` crossing `ramTail`), sustained spill
+cycles, chunk-hash reconciliation on reconnect with a non-trivial
+gap, normal exit.
+
+Notes on the recipe:
+- The `pkill` is what actually triggers xssh's reconnect. Without
+  `ServerAliveInterval` in `~/.ssh/config`, just disabling the link
+  doesn't cause ssh to die — TCP retransmits invisibly until you
+  restore the link, at which point the session resumes without ever
+  going through reconnect.
+- Disabling the network around the `pkill` is what makes the gap
+  large enough to be a meaningful reconcile test. Without it,
+  `pkill` triggers an immediate reconnect with only a few hundred
+  bytes of lag.
+- Don't wait too long with the network down: each failed reconnect
+  attempt counts toward the 5-strikes-and-out budget, after which
+  the client exits with code 129 (`remote daemon stopped`). Each
+  attempt takes ~21 s of TCP-SYN timeout, so you have ~100 s of
+  budget before that fires.
+
+**Test B — daemon overflow + replay (destroys the session)**
+
+```
+xssh user@host
+sleep 20; seq 1 50000000         # ~430 MiB once seq starts; won't finish before overflow
+```
+
+The `sleep 20` gives you 20 s to switch to another shell and stage
+the disable-network command. As `seq` is running, **disable networking
+to the remote and leave it down** for 30–60 seconds. The remote daemon's held bytes will cross
+100 MiB, it'll exit preserving on-disk state. Re-enable networking;
+the client reconnects, the replay daemon serves the buffered output,
+and the session ends with:
+
+```
+continuous-ssh: remote daemon stopped.
+```
+
+and exit code `129`.
+
+Exercises: daemon overflow path, on-disk preservation + `clean`
+marker, replay daemon, `EXIT(129)` message, terminal restore on the
+129 path.
+
+**Minimal regression check**: just run **Test A**. It triggers the
+case that motivated the buffer rewrite; Test B destroys the session
+and verifies a code path that's hit much less often in practice.
 
 ## License
 

@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zziigguurraatt/continuous-ssh/internal/buffer"
 	"github.com/zziigguurraatt/continuous-ssh/internal/daemon"
 	"github.com/zziigguurraatt/continuous-ssh/internal/dlog"
 )
@@ -83,12 +84,13 @@ func Run(argv []string) int {
 		conn, err = net.Dial("unix", sockPath)
 	}
 	if err != nil {
-		// Dial failed. If the session directory still has an output.log,
-		// the daemon process is gone but a recoverable session lives on
-		// disk — spawn a replay daemon to serve what's there.
-		outputPath := filepath.Join(sd, "output.log")
-		if _, sterr := os.Stat(outputPath); sterr == nil {
-			dlog.V("dial failed (%v); session files present, spawning replay daemon", err)
+		// Dial failed. If the session directory still has any output.log
+		// segment files, the daemon process is gone but a recoverable
+		// session lives on disk — spawn a replay daemon to serve what's
+		// there.
+		segs, segErr := buffer.ScanSegments(filepath.Join(sd, "output.log"))
+		if segErr == nil && len(segs) > 0 {
+			dlog.V("dial failed (%v); %d segment(s) present, spawning replay daemon", err, len(segs))
 			if serr := spawnReplayDaemon(sessionID, debug); serr != nil {
 				dlog.E("spawn replay daemon: %v", serr)
 				return 1

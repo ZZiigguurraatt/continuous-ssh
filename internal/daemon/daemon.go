@@ -75,7 +75,7 @@ func Run(argv []string) int {
 	infoPath := filepath.Join(sessionDir, "info")
 	_ = os.WriteFile(infoPath, []byte(fmt.Sprintf("started=%s\n", time.Now().Format(time.RFC3339))), 0o600)
 
-	outputBuf, err := buffer.New(filepath.Join(sessionDir, "output.log"), 0, 0, 0)
+	outputBuf, err := buffer.New(filepath.Join(sessionDir, "output.log"), 0, 0, 0, 0)
 	if err != nil {
 		dlog.E("output buffer: %v", err)
 		return 1
@@ -153,7 +153,37 @@ func Run(argv []string) int {
 		d.pumpPTY()
 	}()
 
+	// Owner-goroutine for ptmx.Write so that readUpstream never blocks on
+	// PTY-input backpressure. If the foreground remote program isn't
+	// reading stdin (e.g. `seq 1 N` while running), the PTY input buffer
+	// fills up and ptmx.Write blocks. With the dispatch decoupled,
+	// readUpstream stays responsive — it can still process Shutdown / Ack
+	// / Resize frames immediately so `~.` works even when input is
+	// jammed. When the channel is full, we drop the Stdin frame on the
+	// floor: input during a wedge is best-effort by design (the design
+	// promise is "no stdin replay across reconnects" already).
+	d.stdinCh = make(chan []byte, stdinChCapacity)
+	stdinWriterDone := make(chan struct{})
+	go func() {
+		defer close(stdinWriterDone)
+		for data := range d.stdinCh {
+			if _, werr := d.ptmx.Write(data); werr != nil {
+				dlog.E("pty stdin write: %v", werr)
+				return
+			}
+		}
+	}()
+
 	go d.waitCmd(cmd, pumpDone)
+
+	// Buffer-state heartbeat — only when verbose. Logs a snapshot every
+	// statsHeartbeat seconds so post-mortem analysis of a hang/freeze
+	// can see how held bytes, RAM tail, and disk file size evolved.
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		d.statsHeartbeat(pumpDone)
+	}()
 
 	d.acceptLoop(listener)
 
@@ -161,6 +191,8 @@ func Run(argv []string) int {
 	_ = ptmx.Close()
 	<-pumpDone
 	d.attachesWG.Wait()
+	close(d.stdinCh) // shut down the ptmx writer goroutine
+	<-stdinWriterDone
 
 	d.mu.Lock()
 	// preserveOnExit is set on signal-induced shutdown and on buffer
@@ -294,6 +326,14 @@ type daemon struct {
 	outputBuf *buffer.Buffer
 	ptmx      *os.File
 
+	// stdinCh hands Stdin payloads from readUpstream to the
+	// per-daemon ptmx-writer goroutine. Buffered so readUpstream can
+	// drop frames non-blockingly when the PTY input buffer is full
+	// (which happens when the remote foreground program isn't reading
+	// stdin) — without it, readUpstream would block on ptmx.Write and
+	// stop processing Shutdown / Ack / Resize frames.
+	stdinCh chan []byte
+
 	mu   sync.Mutex
 	cond *sync.Cond
 
@@ -338,6 +378,13 @@ const cleanMarkerName = "clean"
 
 const keepAliveGrace = 30 * time.Second
 
+// stdinChCapacity is how many Stdin frames the ptmx writer can have
+// queued before readUpstream starts dropping new ones. Large enough
+// that brief PTY-input back-pressure doesn't drop bursts of typing,
+// small enough that we don't accumulate megabytes of stale keystrokes
+// across a long wedge.
+const stdinChCapacity = 64
+
 // touchKeepAlive bumps the keep-alive deadline forward and schedules a
 // broadcast so the accept-stopper wakes when the new deadline elapses.
 // Caller must hold d.mu.
@@ -354,6 +401,44 @@ func (d *daemon) wake() {
 	d.mu.Lock()
 	d.cond.Broadcast()
 	d.mu.Unlock()
+}
+
+// firstFew returns up to n bytes of p as a short %q-safe slice for log lines.
+// Used to correlate frame content with offsets without dumping kilobytes.
+func firstFew(p []byte, n int) []byte {
+	if len(p) > n {
+		return p[:n]
+	}
+	return p
+}
+
+// statsHeartbeat logs a buffer-state snapshot every statsHeartbeat
+// seconds while the PTY pump is running, and once more at exit. Only
+// active in verbose mode — the gating happens inside dlog.V so the
+// formatting cost is paid only when verbose.
+//
+// Useful for post-mortem: track held bytes vs disk file size to spot
+// disk-spill bugs, see whether ACKs are arriving, and confirm RAM
+// tail isn't drifting up unexpectedly.
+func (d *daemon) statsHeartbeat(pumpDone <-chan struct{}) {
+	const interval = 10 * time.Second
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	log := func() {
+		s := d.outputBuf.Stats()
+		dlog.V("stats: total=%d held=%d ram=%d disk=%d diskFile=%d trim=%d mem=%d chunks=%d",
+			s.Total, s.HeldBytes, s.RAMBytes, s.DiskBytes,
+			s.DiskFileSize, s.TrimOffset, s.MemOffset, s.NumChunks)
+	}
+	for {
+		select {
+		case <-pumpDone:
+			log()
+			return
+		case <-t.C:
+			log()
+		}
+	}
 }
 
 func (d *daemon) pumpPTY() {
@@ -617,6 +702,7 @@ func (d *daemon) streamLoop(ctx context.Context, pc *proto.Conn, from uint64) {
 		for {
 			n, err := d.outputBuf.ReadAt(send, off)
 			if n > 0 {
+				dlog.V("OUT off=%d n=%d firstBytes=%q", off, n, firstFew(send[:n], 16))
 				if werr := pc.WriteFrame(proto.Frame{Type: proto.Output, Offset: off, Payload: send[:n]}); werr != nil {
 					return
 				}
@@ -629,6 +715,7 @@ func (d *daemon) streamLoop(ctx context.Context, pc *proto.Conn, from uint64) {
 				break
 			}
 			if err != nil {
+				dlog.E("streamLoop ReadAt off=%d err=%v", off, err)
 				return
 			}
 			if uint64(n) < uint64(len(send)) {
@@ -650,9 +737,15 @@ func (d *daemon) readUpstream(pc *proto.Conn) {
 		}
 		switch f.Type {
 		case proto.Stdin:
-			if _, werr := d.ptmx.Write(f.Payload); werr != nil {
-				dlog.E("pty stdin write: %v", werr)
-				return
+			// Non-blocking dispatch. If the PTY input buffer is full
+			// (foreground program not reading stdin), the writer
+			// goroutine is stuck and this channel fills up — drop the
+			// frame rather than blocking readUpstream, which must stay
+			// responsive to Shutdown / Ack / Resize.
+			select {
+			case d.stdinCh <- f.Payload:
+			default:
+				dlog.V("stdin dropped: writer blocked, %d bytes", len(f.Payload))
 			}
 		case proto.Resize:
 			rp, derr := chunk.DecodeResize(f.Payload)
@@ -696,11 +789,71 @@ func manifestOf(b *buffer.Buffer) chunk.Manifest {
 	}
 }
 
-// ReplayRun serves the contents of a previous session's output.log to one
-// attaching client, then removes the session directory and exits. It is
-// spawned by attach when it finds a stale session directory (output.log
-// present but the regular daemon process is gone — e.g., after a remote
-// reboot or a SIGKILL).
+// streamSegments writes OUTPUT frames for the byte range [from, last
+// segment end) by opening segments in order and reading sequentially.
+// Returns 129 on success, 1 on write/read error (mirrors the existing
+// ReplayRun exit-code contract). The caller passes a reusable byte
+// buffer to avoid per-segment allocation.
+func streamSegments(pc *proto.Conn, segs []buffer.SegmentInfo, from uint64, send []byte) int {
+	off := from
+	for i := range segs {
+		seg := segs[i]
+		if seg.EndOff <= off {
+			continue // entirely below where the client already is
+		}
+		f, err := os.Open(seg.Path)
+		if err != nil {
+			dlog.E("open segment %s: %v", seg.Path, err)
+			return 1
+		}
+		// If `off` is inside this segment, skip to the right spot;
+		// otherwise start at the beginning of the segment.
+		var relOff int64
+		if off > seg.StartOff {
+			relOff = int64(off - seg.StartOff)
+		} else {
+			off = seg.StartOff
+		}
+		if relOff > 0 {
+			if _, err := f.Seek(relOff, io.SeekStart); err != nil {
+				dlog.E("seek segment %s: %v", seg.Path, err)
+				_ = f.Close()
+				return 1
+			}
+		}
+		for off < seg.EndOff {
+			chunkLen := uint64(len(send))
+			if off+chunkLen > seg.EndOff {
+				chunkLen = seg.EndOff - off
+			}
+			n, rerr := f.Read(send[:chunkLen])
+			if n > 0 {
+				if werr := pc.WriteFrame(proto.Frame{Type: proto.Output, Offset: off, Payload: send[:n]}); werr != nil {
+					dlog.E("output write: %v", werr)
+					_ = f.Close()
+					return 1
+				}
+				off += uint64(n)
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				dlog.E("segment read %s: %v", seg.Path, rerr)
+				_ = f.Close()
+				return 1
+			}
+		}
+		_ = f.Close()
+	}
+	return 129
+}
+
+// ReplayRun serves the contents of a previous session's on-disk segment
+// files to one attaching client, then removes the session directory
+// and exits. Spawned by attach when it finds a stale session directory
+// (segment files present but the regular daemon process is gone —
+// e.g., after a remote reboot or a SIGKILL).
 //
 // Compared to the regular daemon: no PTY, no command, no in-memory buffer,
 // no keep-alive grace. We listen exactly long enough to serve one bridge,
@@ -731,20 +884,20 @@ func ReplayRun(sessionID string, debug bool) int {
 	_, markerErr := os.Stat(markerPath)
 	cleanShutdown := markerErr == nil
 
-	outputPath := filepath.Join(sessionDir, "output.log")
-	f, err := os.Open(outputPath)
+	// The buffer was persisted as a series of segment files at the
+	// "output.log" prefix; enumerate them and treat the last segment's
+	// end offset as the total stream size.
+	prefix := filepath.Join(sessionDir, "output.log")
+	segs, err := buffer.ScanSegments(prefix)
 	if err != nil {
-		dlog.E("open output.log: %v", err)
+		dlog.E("scan segments: %v", err)
 		return 1
 	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		dlog.E("stat output.log: %v", err)
-		return 1
+	var totalSize uint64
+	if len(segs) > 0 {
+		totalSize = segs[len(segs)-1].EndOff
 	}
-	totalSize := uint64(fi.Size())
-	dlog.V("replay totalSize=%d cleanShutdown=%v", totalSize, cleanShutdown)
+	dlog.V("replay segments=%d totalSize=%d cleanShutdown=%v", len(segs), totalSize, cleanShutdown)
 
 	sockPath := filepath.Join(sessionDir, "sock")
 	_ = os.Remove(sockPath)
@@ -826,29 +979,15 @@ func ReplayRun(sessionID string, debug bool) int {
 	if !cleanShutdown {
 		exitCode = 130
 	} else {
-		// Stream the on-disk content. The client dedups what it already
-		// has against its local buffer via offset.
+		// Stream segments in order. Client dedups by offset, so we can
+		// start from any point — but the client's HELLO already told us
+		// how far it has, so honour that to avoid retransmitting bytes
+		// it already holds (the client's offset is the lower bound;
+		// anything below it is overlap we'd just throw away).
+		off := hello.Output.Total
 		send := make([]byte, 64*1024)
-		var off uint64
-		for off < totalSize {
-			n, rerr := f.ReadAt(send, int64(off))
-			if n > 0 {
-				if werr := pc.WriteFrame(proto.Frame{Type: proto.Output, Offset: off, Payload: send[:n]}); werr != nil {
-					dlog.E("output write: %v", werr)
-					break
-				}
-				off += uint64(n)
-			}
-			if rerr == io.EOF {
-				break
-			}
-			if rerr != nil {
-				dlog.E("output read: %v", rerr)
-				break
-			}
-		}
-		dlog.V("replay streamed %d bytes", off)
-		exitCode = 129
+		exitCode = streamSegments(pc, segs, off, send)
+		dlog.V("replay streamed from offset %d to %d", hello.Output.Total, totalSize)
 	}
 
 	var ec [4]byte

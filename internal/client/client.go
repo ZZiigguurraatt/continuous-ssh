@@ -29,10 +29,10 @@ import (
 )
 
 // Run is the client entry point. argv excludes the program name. Anything
-// other than our own `--debug` flag is forwarded to `ssh` as arguments. The
-// remote always runs the user's login shell.
+// other than our own `--debug` / `--debug-file` flag is forwarded to `ssh`
+// as arguments. The remote always runs the user's login shell.
 func Run(argv []string) int {
-	sshArgs, debug, err := parseArgs(argv)
+	sshArgs, debug, debugFile, err := parseArgs(argv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "continuous-ssh: %v\n", err)
 		return 2
@@ -44,23 +44,41 @@ func Run(argv []string) int {
 		return 1
 	}
 
-	logPath, err := clientLogPath()
-	if err == nil {
-		_ = os.MkdirAll(filepath.Dir(logPath), 0o700)
-	}
-	var stderrSink io.Writer
+	// Only create a per-invocation log file when the user explicitly
+	// asks for logging. Without --debug/--debug-file, dlog.Setup with
+	// an empty path falls through to io.Discard — no file, no clutter
+	// in ~/.continuous-ssh/clients/.
+	var logPath string
 	if debug {
+		p, perr := clientLogPath(sshArgs)
+		if perr == nil {
+			_ = os.MkdirAll(filepath.Dir(p), 0o700)
+			logPath = p
+		}
+	}
+	// --debug mirrors verbose logging to stderr; --debug-file routes
+	// the same verbose logging only to the file, leaving the terminal
+	// clean. Both turn on verbose mode and both propagate to the
+	// remote attach (where dlog is always file-only anyway).
+	var stderrSink io.Writer
+	if debug && !debugFile {
 		stderrSink = dlog.CRLFWriter{W: os.Stderr}
 	}
 	_ = dlog.Setup(logPath, debug, stderrSink)
-	dlog.E("client starting debug=%v sshArgs=%v", debug, sshArgs)
+	dlog.E("client starting debug=%v debugFile=%v sshArgs=%v", debug, debugFile, sshArgs)
+	// In --debug-file mode the user has no terminal mirror to tell
+	// them where the log went. Print the path once on startup so they
+	// can `tail -f` it from another shell.
+	if debug && debugFile && logPath != "" {
+		fmt.Fprintf(os.Stderr, "continuous-ssh: logging to %s\n", logPath)
+	}
 
 	// No on-disk buffer on the client — sliding 10 MiB RAM window only.
 	// We ACK every 5 MiB so the daemon trims its own buffer in lockstep;
 	// past bytes that fall off the window are still tracked by the byte
 	// counter (Buffer.Len) so dedup on reconnect works by offset alone.
 	const clientBufRAM uint64 = 10 << 20
-	outputBuf, err := buffer.New("", clientBufRAM, clientBufRAM, clientBufRAM)
+	outputBuf, err := buffer.New("", clientBufRAM, 0, 0, clientBufRAM)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "continuous-ssh: %v\n", err)
 		return 1
@@ -83,6 +101,33 @@ func Run(argv []string) int {
 			_ = term.Restore(stdinFd, c.oldState)
 		}
 	}()
+
+	// SIGTERM/SIGHUP can land while we're in raw mode (`kill <pid>` from
+	// another shell, parent terminal closing, etc.). Go's default handler
+	// would exit immediately, skipping our deferred term.Restore and
+	// leaving the terminal in raw mode forever. Catch those signals and
+	// run the cleanup before exiting. SIGINT is handled by raw mode
+	// itself once we're in it (Ctrl-C becomes a keystroke forwarded to
+	// the remote), so we don't need to intercept it.
+	//
+	// SIGKILL still wins — there's no userspace recovery from that —
+	// so users out of options can still wedge the terminal. `reset` or
+	// `stty sane` fixes it.
+	cleanupSigCh := make(chan os.Signal, 1)
+	signal.Notify(cleanupSigCh, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		s, ok := <-cleanupSigCh
+		if !ok {
+			return
+		}
+		if c.oldState != nil {
+			_ = term.Restore(stdinFd, c.oldState)
+			sendTerminalReset(os.Stdout, c.inAltScreen.Load())
+		}
+		fmt.Fprintf(os.Stderr, "continuous-ssh: terminated by %v\n", s)
+		os.Exit(143)
+	}()
+	defer signal.Stop(cleanupSigCh)
 
 	code := c.run()
 
@@ -146,34 +191,103 @@ func Run(argv []string) int {
 	return code
 }
 
-// parseArgs splits the client argv into (ssh-args, debug).
+// parseArgs splits the client argv into (ssh-args, debug, debugFile).
 //
 // Grammar:
 //
-//	xssh [--debug] [ssh-args...]
+//	xssh [--debug | --debug-file] [ssh-args...]
 //
-// Every argv element except our own `--debug` is forwarded to `ssh`
-// verbatim. The remote always runs the user's login shell.
-func parseArgs(argv []string) (sshArgs []string, debug bool, err error) {
+// --debug      enables verbose logging to a per-invocation file
+//
+//	under ~/.continuous-ssh/clients/<date>-<target>-<pid>.log
+//	AND mirrors to stderr (CR-LF-translated in raw mode).
+//
+// --debug-file is the same but file-only — no stderr mirror. The
+//
+//	log path is printed to stderr once on startup so you can
+//	tail it from another shell.
+//
+// Every other argv element is forwarded to `ssh` verbatim.
+func parseArgs(argv []string) (sshArgs []string, debug, debugFile bool, err error) {
 	for _, t := range argv {
-		if t == "--debug" {
+		switch t {
+		case "--debug":
 			debug = true
-			continue
+		case "--debug-file":
+			debug = true
+			debugFile = true
+		default:
+			sshArgs = append(sshArgs, t)
 		}
-		sshArgs = append(sshArgs, t)
 	}
 	if len(sshArgs) == 0 {
-		return nil, false, errors.New("ssh target required")
+		return nil, false, false, errors.New("ssh target required")
 	}
-	return sshArgs, debug, nil
+	return sshArgs, debug, debugFile, nil
 }
 
-func clientLogPath() (string, error) {
+// clientLogPath builds a per-invocation log path under
+// ~/.continuous-ssh/clients/. Filename format:
+//
+//	<YYYYMMDD-HHMMSS>-<sanitized-target>-<pid>.log
+//
+// The timestamp makes the directory sortable; the target makes it easy
+// to find logs for a given host at a glance; the PID disambiguates if
+// two invocations land in the same second. Each xssh invocation gets
+// its own file — no append-mode interleaving with concurrent sessions.
+func clientLogPath(sshArgs []string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".continuous-ssh", "client.log"), nil
+	target := "unknown-host"
+	// Best-effort target extraction: scan from the end of argv for the
+	// first non-flag token. Handles the canonical `xssh [flags] user@host`
+	// case. Doesn't try to be a complete ssh-arg parser; if you put the
+	// target before value-taking flags the filename will fall back to the
+	// "unknown-host" default, signalling that the heuristic didn't find
+	// it. parseArgs above has already rejected empty-target invocations.
+	for i := len(sshArgs) - 1; i >= 0; i-- {
+		t := sshArgs[i]
+		if strings.HasPrefix(t, "-") {
+			break
+		}
+		target = sanitizeForFilename(t)
+		break
+	}
+	stamp := time.Now().Format("20060102-150405")
+	name := fmt.Sprintf("%s-%s-%d.log", stamp, target, os.Getpid())
+	return filepath.Join(home, ".continuous-ssh", "clients", name), nil
+}
+
+// firstFewBytes returns up to n bytes of p for use in log lines —
+// keeps debug logs compact while still preserving content correlation
+// with offsets.
+func firstFewBytes(p []byte, n int) []byte {
+	if len(p) > n {
+		return p[:n]
+	}
+	return p
+}
+
+// sanitizeForFilename replaces filesystem-unfriendly characters in a
+// host string so it's safe to use as a path component.
+func sanitizeForFilename(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-' || r == '.' || r == '_':
+			b.WriteRune(r)
+		case r == '@':
+			b.WriteString("_at_")
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
 }
 
 type client struct {
@@ -506,11 +620,24 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		result = runResult{exit: true, exitCode: code}
 	case <-ctx.Done():
 		dlog.V("session: context done (abort) — sending SHUTDOWN")
-		// Best-effort: tell the daemon to kill the remote shell and clean
-		// up its session dir. The frame may fail to flush if the link is
-		// already dead; that's fine, the daemon's keep-alive timer will
-		// pick up the slack.
-		_ = pc.WriteFrame(proto.Frame{Type: proto.Shutdown})
+		// Best-effort: tell the daemon to kill the remote shell and
+		// clean up its session dir. We launch WriteFrame in its own
+		// goroutine with a tight timeout so the abort path always
+		// makes progress even if pc.WriteFrame is wedged (e.g. the
+		// SSH stdin pipe is full because the daemon's readUpstream is
+		// blocked on something). When the timeout fires we fall
+		// through to killSSH which closes the pipes, unblocking any
+		// stuck WriteFrame.
+		shutdownDone := make(chan struct{})
+		go func() {
+			defer close(shutdownDone)
+			_ = pc.WriteFrame(proto.Frame{Type: proto.Shutdown})
+		}()
+		select {
+		case <-shutdownDone:
+		case <-time.After(500 * time.Millisecond):
+			dlog.E("SHUTDOWN write timed out, force-killing ssh")
+		}
 		// Give ssh a moment to deliver the frame and exit on its own
 		// (which it will once the remote attach disconnects).
 		select {
@@ -664,12 +791,14 @@ func (c *client) handleOutputFrame(f proto.Frame) {
 	payload := f.Payload
 	total := c.outputBuf.Len()
 
+	dlog.V("IN  off=%d len=%d total=%d firstBytes=%q", off, len(payload), total, firstFewBytes(payload, 16))
+
 	if off+uint64(len(payload)) <= total {
 		dlog.V("output overlap: off=%d len=%d total=%d (skipped)", off, len(payload), total)
 		return
 	}
 	if off > total {
-		dlog.E("output gap: off=%d total=%d (dropping frame)", off, total)
+		dlog.E("output gap: off=%d total=%d (dropping frame) firstBytes=%q", off, total, firstFewBytes(payload, 16))
 		return
 	}
 	skip := total - off

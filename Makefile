@@ -69,25 +69,26 @@ help: ## Display this help.
 
 ##@ Build
 
+# Build targets are .PHONY because `go build` already has a content-aware
+# cache: re-running it is free when nothing changed, and reliable when
+# something did. Letting Make second-guess (via file-mtime rules against
+# the bin/ directory) made `make build` silently skip rebuilds whenever
+# bin/xssh already existed.
 .PHONY: build
-build: $(NATIVE) ## Build native binary into bin/xssh.
-$(NATIVE): $(LOCALBIN)
-	go build -o $@ $(PKG)
+build: | $(LOCALBIN) ## Build native binary into bin/xssh.
+	go build -o $(NATIVE) $(PKG)
 
 .PHONY: pi64
-pi64: $(PI64) ## Cross-compile for Raspberry Pi 3/4/5 (64-bit OS) into bin/xssh-arm64.
-$(PI64): $(LOCALBIN)
-	GOOS=linux GOARCH=arm64 go build -o $@ $(PKG)
+pi64: | $(LOCALBIN) ## Cross-compile for Raspberry Pi 3/4/5 (64-bit OS) into bin/xssh-arm64.
+	GOOS=linux GOARCH=arm64 go build -o $(PI64) $(PKG)
 
 .PHONY: pi32
-pi32: $(PI32) ## Cross-compile for Pi 2 / Pi 3 (32-bit OS) into bin/xssh-armv7.
-$(PI32): $(LOCALBIN)
-	GOOS=linux GOARCH=arm GOARM=7 go build -o $@ $(PKG)
+pi32: | $(LOCALBIN) ## Cross-compile for Pi 2 / Pi 3 (32-bit OS) into bin/xssh-armv7.
+	GOOS=linux GOARCH=arm GOARM=7 go build -o $(PI32) $(PKG)
 
 .PHONY: pi-zero
-pi-zero: $(PI_ZERO) ## Cross-compile for Pi 1 / Pi Zero (ARMv6) into bin/xssh-armv6.
-$(PI_ZERO): $(LOCALBIN)
-	GOOS=linux GOARCH=arm GOARM=6 go build -o $@ $(PKG)
+pi-zero: | $(LOCALBIN) ## Cross-compile for Pi 1 / Pi Zero (ARMv6) into bin/xssh-armv6.
+	GOOS=linux GOARCH=arm GOARM=6 go build -o $(PI_ZERO) $(PKG)
 
 .PHONY: clean
 clean: ## Remove built binaries.
