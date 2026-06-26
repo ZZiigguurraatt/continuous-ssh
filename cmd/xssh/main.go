@@ -35,6 +35,10 @@ func main() {
 	}
 }
 
+// usage prints the help text shown by `xssh -h`. The README's
+// "## Usage" section embeds this verbatim — if you edit the text
+// below, copy the new output into README.md too so the docs don't
+// drift from the binary.
 func usage() {
 	fmt.Fprintln(os.Stderr, `xssh — continuous-ssh: interactive SSH that survives disconnects.
 

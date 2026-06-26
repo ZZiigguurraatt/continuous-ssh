@@ -272,11 +272,51 @@ non-login shell.
 ## Usage
 
 ```
-xssh [--debug] [ssh-args...] user@host
-```
+$ xssh -h
+xssh — continuous-ssh: interactive SSH that survives disconnects.
+
+Usage:
+  xssh [--debug | --debug-file | --trace-file] [ssh-args...] <target>
 
 The remote always runs your login shell. ssh-args (flags + target) are
-passed through verbatim to the system `ssh` binary.
+forwarded verbatim to the system ssh binary. On disconnect the wrapper
+reconnects silently; if the remote session is unrecoverable it gives up
+after a few attempts.
+
+Flags:
+  --debug       verbose logging to a per-invocation file under
+                ~/.continuous-ssh/clients/<date>-<target>-<pid>.log AND
+                mirrored to stderr (CR-LF translated in raw mode).
+                Propagated to the remote attach and daemon. ssh's own
+                stderr is captured into the log instead of being discarded.
+  --debug-file  same level as --debug but file-only — no stderr mirror.
+                Prints the log path on startup so you can tail it from
+                another shell.
+  --trace-file  bumps the log level: also captures per-frame chatter
+                (OUT/IN frames, every ACK sent, overlap drops). Always
+                file-only — would flood the terminal otherwise. High
+                volume: thousands of lines per session under load.
+
+Key sequences (at start of line):
+  ~.   abort and exit
+  ~~   send a literal ~
+
+Subcommands (run on the host where the daemon lives):
+  ls    list sessions in ~/.continuous-ssh/sessions/
+        flags: --active, --stale, --dead, --all
+  kill  terminate sessions; preserves stale-session data for replay.
+        usage: xssh kill <id> | --all | --active | --stale | --dead
+  rm    remove a Dead session's on-disk directory. By default refuses
+        to operate on a live daemon; pass --kill to terminate it first.
+        usage: xssh rm [--kill] <id> | --all | --active | --stale | --dead
+
+Internal subcommands (invoked remotely; not for direct use):
+  attach   bridge ssh stdio to a session daemon
+  daemon   run a session daemon
+```
+
+ssh-args (flags + target) are passed through verbatim to the system
+`ssh` binary.
 
 Stdin must be a TTY. Piped or redirected stdin is rejected at startup.
 
