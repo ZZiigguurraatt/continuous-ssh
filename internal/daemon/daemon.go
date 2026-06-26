@@ -195,14 +195,11 @@ func Run(argv []string) int {
 	<-stdinWriterDone
 
 	d.mu.Lock()
-	// preserveOnExit is set on signal-induced shutdown and on buffer
-	// overflow. In both cases we keep the on-disk buffer + clean marker
-	// so a later replay can serve it — even when an active client just
-	// received EXIT through the live connection. The active-client case
-	// produces a redundant on-disk copy (the client already has every
-	// byte), but it's a few KB-to-MB and `xssh rm` is right there for
-	// cleanup.
-	preserve := d.preserveOnExit
+	// Preserve the session for a later replay daemon when the client
+	// didn't already receive EXIT live, the user didn't abort with
+	// `~.`, and either the signal/overflow path set preserveOnExit
+	// or the shell exited on its own.
+	preserve := !d.exitDelivered && (d.preserveOnExit || (d.exited && !d.shutdown))
 	d.mu.Unlock()
 
 	// Close(false) flushes the in-RAM tail to disk; Close(true) just
