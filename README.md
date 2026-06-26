@@ -132,6 +132,47 @@ This drops the `xssh` binary in `$(go env GOBIN)` (which falls back to
 build (e.g. for a Raspberry Pi), clone the repo and use the Makefile
 targets below.
 
+### Nix flake
+
+If you have [Nix](https://nixos.org/) with flakes enabled, you can run
+`xssh` without installing anything into your profile:
+
+```
+nix run github:zziigguurraatt/continuous-ssh#xssh -- <ssh-args...> <target>
+```
+
+Or, from a clone:
+
+```
+nix run .#xssh -- <ssh-args...> <target>
+```
+
+Everything after `--` is forwarded to `xssh` verbatim, so subcommands
+work too (`nix run .#xssh -- ls`, `nix run .#xssh -- -h`).
+
+To build the package (binary lands in `result/bin/xssh`, with bash and
+zsh completions under `result/share/`):
+
+```
+nix build .#xssh
+```
+
+Or install it into your profile:
+
+```
+nix profile install github:zziigguurraatt/continuous-ssh#xssh
+```
+
+The flake builds with `buildGoModule` and pins the dependency set via
+`vendorHash`. If you bump dependencies in `go.mod`/`go.sum`, update
+`vendorHash` in `flake.nix`: set it to a string of all `A`s, run
+`nix build .#xssh`, and copy the `got:` hash from the error back in.
+
+Like `go install`, the flake produces only a native binary (for the host
+system); for a cross-compiled Raspberry Pi build use the Makefile targets
+below. `xssh` shells out to the system `ssh` at runtime, so make sure
+`openssh` is available on your `PATH`.
+
 ### Builds (from a clone)
 
 A `Makefile` is provided. Run `make help` to list every target with a
