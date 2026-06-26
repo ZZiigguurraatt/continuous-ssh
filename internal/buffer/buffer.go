@@ -34,15 +34,12 @@ const (
 	DefaultRAMTail     uint64 = 10 << 20
 	DefaultChunkSize   uint64 = 1 << 20
 	DefaultSegmentSize uint64 = 10 << 20
-	DefaultMaxBytes    uint64 = 100 << 20
 )
 
 // segmentFormat builds segment paths from the prefix + start offset.
 // Twenty zero-padded decimal digits comfortably fits any uint64 byte
 // count and keeps directory listings sortable by name.
 const segmentFormat = "%s.%020d"
-
-var ErrOverflow = errors.New("buffer: max size exceeded")
 
 type Hash [sha256.Size]byte
 
@@ -61,7 +58,6 @@ type Buffer struct {
 	ramTail     uint64
 	chunkSize   uint64
 	segmentSize uint64
-	maxBytes    uint64
 
 	mem       []byte
 	memOffset uint64
@@ -97,9 +93,8 @@ type Buffer struct {
 // empty the buffer is RAM-only: appends past the RAM tail silently
 // drop the oldest bytes.
 //
-// Passing 0 for any limit selects the default. maxBytes caps HELD
-// bytes (total - trimOffset), not cumulative throughput.
-func New(diskPath string, ramTail, chunkSize, segmentSize, maxBytes uint64) (*Buffer, error) {
+// Passing 0 for any limit selects the default.
+func New(diskPath string, ramTail, chunkSize, segmentSize uint64) (*Buffer, error) {
 	if ramTail == 0 {
 		ramTail = DefaultRAMTail
 	}
@@ -109,14 +104,10 @@ func New(diskPath string, ramTail, chunkSize, segmentSize, maxBytes uint64) (*Bu
 	if segmentSize == 0 {
 		segmentSize = DefaultSegmentSize
 	}
-	if maxBytes == 0 {
-		maxBytes = DefaultMaxBytes
-	}
 	b := &Buffer{
 		ramTail:     ramTail,
 		chunkSize:   chunkSize,
 		segmentSize: segmentSize,
-		maxBytes:    maxBytes,
 		mem:         make([]byte, 0, ramTail),
 		curHasher:   sha256.New(),
 		notify:      make(chan struct{}),
@@ -271,31 +262,16 @@ func (b *Buffer) spillToDisk(data []byte) error {
 	return nil
 }
 
-// Append adds p to the buffer. Returns ErrOverflow if held bytes would
-// exceed the cap; on overflow the buffer is left unchanged so callers
-// can react (e.g. the daemon flips to shutdown).
+// Append adds p to the buffer. Returns an error only if the buffer
+// is sealed. Disk-spilled bytes grow without an internal cap; the
+// global disk-cap sweeper (in internal/daemon) enforces the host-wide
+// policy.
 func (b *Buffer) Append(p []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.sealed {
 		return errors.New("buffer: sealed")
-	}
-	// Overflow only applies to disk-backed buffers (daemon side). In
-	// no-disk mode the post-append spill loop unconditionally trims
-	// `len(mem) - ramTail` bytes from the front of the sliding window,
-	// so there's always room for the new write — and the maxBytes
-	// check was incorrectly rejecting otherwise-valid writes the
-	// moment held bytes first reached ramTail (e.g. on the client,
-	// where ramTail == maxBytes == 10 MiB by design). That manifested
-	// as the client's `outputBuf.Len()` getting permanently pinned at
-	// ~10 MiB once total crossed that threshold, with every
-	// subsequent Append returning ErrOverflow silently — see the bug
-	// where seq's output stopped rendering near offset 10469101.
-	if b.diskPrefix != "" {
-		if held := b.total - b.trimOffset; held+uint64(len(p)) > b.maxBytes {
-			return ErrOverflow
-		}
 	}
 
 	// Hash incrementally so a manifest is always cheap to produce.
@@ -512,7 +488,7 @@ func (b *Buffer) TailOffset() uint64 {
 }
 
 // Stats is a point-in-time snapshot used by the daemon's debug
-// heartbeat. HeldBytes is what the overflow cap is measured against;
+// heartbeat. HeldBytes is the count of bytes still in the buffer;
 // everything else helps diagnose where bytes physically sit.
 type Stats struct {
 	Total        uint64
@@ -589,8 +565,8 @@ func (b *Buffer) Seal() {
 // Close releases all segment files. When removeFile is false, the
 // in-RAM tail is first flushed to disk so the persisted segments
 // contain the full buffer; this is the fallback-recovery path used
-// after daemon overflow or signal shutdown. When removeFile is true,
-// every segment file is unlinked and no flush happens.
+// after the disk-cap sweeper or a signal shutdown. When removeFile
+// is true, every segment file is unlinked and no flush happens.
 func (b *Buffer) Close(removeFile bool) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

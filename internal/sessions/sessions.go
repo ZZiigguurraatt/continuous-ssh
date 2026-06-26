@@ -179,7 +179,12 @@ func Render(sessions []Session, w *os.File) {
 		fmt.Fprintln(w, "(no sessions)")
 		return
 	}
-	fmt.Fprintf(w, "%-2s%-34s  %-7s  %-7s  %-10s  %-22s   %s\n",
+	// Compute DiskBudget once so every session's DISK BUF column is
+	// against the same denominator within a single render.
+	free, total, _ := DiskSpace()
+	budget := DiskBudget(sessions, free)
+
+	fmt.Fprintf(w, "%-2s%-34s  %-7s  %-7s  %-15s  %-22s   %s\n",
 		"", "SESSION ID", "STATUS", "PID", "DISK BUF", "LAST CHANGE", "STARTED")
 	now := time.Now()
 	for _, s := range sessions {
@@ -210,15 +215,47 @@ func Render(sessions []Session, w *os.File) {
 			// line up vertically across rows.
 			change = fmt.Sprintf("%-12s (%3s ago)", verb, ago)
 		}
+		// DISK BUF: byte count + percent-of-DiskBudget in parens,
+		// matching the parenthesised style of LAST CHANGE / STARTED.
+		// Byte count right-justified to 8 (max width of humanBytes
+		// output up to GB) so unit chars line up across rows;
+		// percent right-justified to 3 digits.
+		disk := fmt.Sprintf("%8s", humanBytes(s.DiskBytes))
+		if budget > 0 {
+			pct := int(float64(s.DiskBytes) / float64(budget) * 100)
+			disk = fmt.Sprintf("%8s (%3d%%)", humanBytes(s.DiskBytes), pct)
+		}
 		marker := ""
 		if s.IsCurrent {
 			marker = "* "
 		} else {
 			marker = "  "
 		}
-		fmt.Fprintf(w, "%s%-34s  %-7s  %-7s  %-10s  %-22s   %s\n",
-			marker, s.ID, s.Status, pid, humanBytes(s.DiskBytes), change, started)
+		fmt.Fprintf(w, "%s%-34s  %-7s  %-7s  %-15s  %-22s   %s\n",
+			marker, s.ID, s.Status, pid, disk, change, started)
 	}
+
+	// Footer (for reference): total buffer usage across all sessions,
+	// the DiskBudget those sessions evaluate against, and the
+	// filesystem's free / total capacity.
+	bufferTotal := TotalDiskUsage(sessions)
+	bufPctStr := ""
+	if budget > 0 {
+		pct := int(float64(bufferTotal) / float64(budget) * 100)
+		bufPctStr = fmt.Sprintf(" (%d%%)", pct)
+	}
+	diskPctStr := ""
+	if total > 0 {
+		pct := int(float64(free) / float64(total) * 100)
+		diskPctStr = fmt.Sprintf(" (%d%%)", pct)
+	}
+	fmt.Fprintf(w, "\nBuffer: %s of %s DiskBudget%s · Disk: %s free of %s%s\n",
+		humanBytes(int64(bufferTotal)),
+		humanBytes(int64(budget)),
+		bufPctStr,
+		humanBytes(int64(free)),
+		humanBytes(int64(total)),
+		diskPctStr)
 }
 
 // mtimeOrZero returns the mtime of the file at path, or the zero time
@@ -230,6 +267,10 @@ func mtimeOrZero(path string) time.Time {
 	}
 	return fi.ModTime()
 }
+
+// SegmentBytes is the exported form of sumSegmentSizes for callers
+// outside this package (the daemon's disk-cap sweeper).
+func SegmentBytes(dir string) int64 { return sumSegmentSizes(dir) }
 
 // sumSegmentSizes adds up the bytes of every output.log.<digits> file
 // under dir. The disk-spill buffer is segmented (see internal/buffer

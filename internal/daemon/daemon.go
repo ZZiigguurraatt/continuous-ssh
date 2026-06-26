@@ -33,6 +33,7 @@ import (
 	"github.com/zziigguurraatt/continuous-ssh/internal/chunk"
 	"github.com/zziigguurraatt/continuous-ssh/internal/dlog"
 	"github.com/zziigguurraatt/continuous-ssh/internal/proto"
+	"github.com/zziigguurraatt/continuous-ssh/internal/sessions"
 )
 
 // Run is the daemon subcommand entry point.
@@ -75,10 +76,18 @@ func Run(argv []string) int {
 	infoPath := filepath.Join(sessionDir, "info")
 	_ = os.WriteFile(infoPath, []byte(fmt.Sprintf("started=%s\n", time.Now().Format(time.RFC3339))), 0o600)
 
-	outputBuf, err := buffer.New(filepath.Join(sessionDir, "output.log"), 0, 0, 0, 0)
+	outputBuf, err := buffer.New(filepath.Join(sessionDir, "output.log"), 0, 0, 0)
 	if err != nil {
 		dlog.E("output buffer: %v", err)
 		return 1
+	}
+
+	// Disk-usage banner: a single line written into the output stream
+	// before the shell starts. Sits at offset 0, becomes part of the
+	// session's scrollback like any other byte. Reconnects don't see
+	// it again — the client already has it from the first attach.
+	if banner := diskUsageBanner(); banner != "" {
+		_ = outputBuf.Append([]byte(banner))
 	}
 
 	sockPath := filepath.Join(sessionDir, "sock")
@@ -185,6 +194,15 @@ func Run(argv []string) int {
 		d.statsHeartbeat(pumpDone)
 	}()
 
+	// Disk-cap sweeper. Ticks every diskCapSweepInterval and shuts
+	// the daemon down (preserving segments for replay) when the
+	// host-wide usage trips the DiskBudget rule.
+	sweepDone := make(chan struct{})
+	go func() {
+		defer close(sweepDone)
+		d.diskCapSweep(pumpDone)
+	}()
+
 	d.acceptLoop(listener)
 
 	d.killCmd(cmd)
@@ -197,7 +215,7 @@ func Run(argv []string) int {
 	d.mu.Lock()
 	// Preserve the session for a later replay daemon when the client
 	// didn't already receive EXIT live, the user didn't abort with
-	// `~.`, and either the signal/overflow path set preserveOnExit
+	// `~.`, and either the signal/disk-cap path set preserveOnExit
 	// or the shell exited on its own.
 	preserve := !d.exitDelivered && (d.preserveOnExit || (d.exited && !d.shutdown))
 	d.mu.Unlock()
@@ -208,8 +226,8 @@ func Run(argv []string) int {
 	closeErr := outputBuf.Close(!preserve)
 	_ = listener.Close()
 
-	dlog.E("daemon exit code=%d preserve=%v overflow=%v closeErr=%v",
-		d.exitCode, preserve, d.overflow.Load(), closeErr)
+	dlog.E("daemon exit code=%d preserve=%v diskcap=%v closeErr=%v",
+		d.exitCode, preserve, d.diskcap.Load(), closeErr)
 
 	if preserve {
 		_ = os.Remove(sockPath)
@@ -223,15 +241,12 @@ func Run(argv []string) int {
 			if werr := os.WriteFile(markerPath, nil, 0o600); werr != nil {
 				dlog.E("write clean marker: %v", werr)
 			}
-			// Overflow marker alongside the clean marker lets the
-			// replay daemon distinguish "daemon stopped because of
-			// signal" (default 129 + generic message) from "daemon
-			// stopped because the held buffer hit its cap" (more
-			// specific message for the user).
-			if d.overflow.Load() {
-				overflowPath := filepath.Join(sessionDir, overflowMarkerName)
-				if werr := os.WriteFile(overflowPath, nil, 0o600); werr != nil {
-					dlog.E("write overflow marker: %v", werr)
+			// Diskcap marker — host-wide disk policy fired. The replay
+			// daemon promotes EXIT(129) to EXIT(134) when it sees this.
+			if d.diskcap.Load() {
+				diskcapPath := filepath.Join(sessionDir, diskcapMarkerName)
+				if werr := os.WriteFile(diskcapPath, nil, 0o600); werr != nil {
+					dlog.E("write diskcap marker: %v", werr)
 				}
 			}
 		} else {
@@ -360,11 +375,11 @@ type daemon struct {
 
 	exited   bool
 	exitCode int
-	overflow atomic.Bool
+	diskcap  atomic.Bool
 
 	// shutdown means "tear down immediately, drop the active attach
-	// abruptly". Set by the SHUTDOWN frame (client abort) and by buffer
-	// overflow.
+	// abruptly". Set by the SHUTDOWN frame (client abort) and by the
+	// disk-cap sweeper firing.
 	shutdown bool
 
 	// signalShutdown means "tear down gracefully: drain the active attach
@@ -375,8 +390,8 @@ type daemon struct {
 	signalShutdown bool
 
 	// preserveOnExit means "the user might want to recover this session;
-	// don't delete output.log on the way out". Set on overflow or on
-	// caught SIGTERM/SIGINT/SIGHUP. The cleanup path additionally writes
+	// don't delete output.log on the way out". Set on disk-cap shutdown
+	// or on caught SIGTERM/SIGINT/SIGHUP. The cleanup path additionally writes
 	// a `clean` marker file iff the buffer flushed without error — the
 	// replay daemon refuses to serve a session that lacks the marker.
 	// Skipped (no preservation) when exitDelivered is true, because the
@@ -394,11 +409,19 @@ type daemon struct {
 // disk. The replay daemon refuses to serve a session that lacks it.
 const cleanMarkerName = "clean"
 
-// overflowMarkerName is written next to the clean marker when the
-// daemon shut down because the held buffer hit its cap. The replay
-// daemon promotes EXIT(129) → EXIT(131) when it sees this so the
-// client can print a more specific message.
-const overflowMarkerName = "overflow"
+// diskcapMarkerName is written next to the clean marker when the
+// daemon shut down because the host-wide disk cap was exceeded
+// (sum of all sessions' segment bytes > DiskBudget and this daemon
+// was above its fair share). The replay daemon promotes EXIT(129)
+// → EXIT(134) when it sees this.
+const diskcapMarkerName = "diskcap"
+
+// diskCapSweepInterval controls how often the daemon checks the
+// global on-disk usage against DiskBudget. The exact value isn't
+// load-bearing — fast growth that briefly overshoots the cap is
+// fine, the cap is a soft ceiling on accumulated bytes, not a
+// per-byte gate.
+const diskCapSweepInterval = 60 * time.Second
 
 // lastAttachName is the file whose mtime tracks the most recent
 // attach or detach event. `xssh ls` displays "X ago" relative to it
@@ -485,23 +508,109 @@ func (d *daemon) statsHeartbeat(pumpDone <-chan struct{}) {
 	}
 }
 
+// diskUsageBanner returns a one-line CRLF-terminated message naming
+// the current disk-cap utilisation, written into the output stream
+// before the shell starts. Returns an empty string on any error so
+// the daemon can still come up if /proc or the home directory is
+// inaccessible.
+func diskUsageBanner() string {
+	sess, err := sessions.List()
+	if err != nil {
+		dlog.E("disk banner: sessions.List: %v", err)
+		return ""
+	}
+	free, err := sessions.FreeDisk()
+	if err != nil {
+		dlog.E("disk banner: FreeDisk: %v", err)
+		return ""
+	}
+	cap := sessions.DiskBudget(sess, free)
+	usage := sessions.TotalDiskUsage(sess)
+	pct := 0
+	if cap > 0 {
+		pct = int(float64(usage) / float64(cap) * 100)
+	}
+	return fmt.Sprintf("continuous-ssh: buffer disk usage %s of %s (%d%%)\r\n",
+		sessions.HumanBytes(int64(usage)),
+		sessions.HumanBytes(int64(cap)),
+		pct)
+}
+
+// diskCapSweep ticks every diskCapSweepInterval and triggers a
+// self-shutdown when the global disk-cap rule fires. Stops as soon
+// as the PTY pump completes (so we don't keep evaluating after the
+// shell has exited on its own).
+func (d *daemon) diskCapSweep(pumpDone <-chan struct{}) {
+	t := time.NewTicker(diskCapSweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-pumpDone:
+			return
+		case <-t.C:
+			if d.diskcap.Load() {
+				return // already shutting down for this reason
+			}
+			d.checkDiskCap()
+		}
+	}
+}
+
+// checkDiskCap evaluates the global rule for this daemon. Decision:
+//
+//	sum_disk > DiskBudget  AND  my_size > DiskBudget / N_growing
+//
+// where N_growing = active + stale sessions and DiskBudget =
+// min(2 GiB, 20% × free_disk) − 100 MiB × N_growing. When both
+// clauses hit, we mark `diskcap`, flip the daemon into the
+// preserve-on-exit shutdown path, and seal the buffer (which wakes
+// pumpPTY's reader and lets serveAttach drain the buffer to a
+// connected client).
+func (d *daemon) checkDiskCap() {
+	sess, err := sessions.List()
+	if err != nil {
+		dlog.E("disk-cap: sessions.List: %v", err)
+		return
+	}
+	free, err := sessions.FreeDisk()
+	if err != nil {
+		dlog.E("disk-cap: FreeDisk: %v", err)
+		return
+	}
+	cap := sessions.DiskBudget(sess, free)
+	sum := sessions.TotalDiskUsage(sess)
+	growing := sessions.GrowingCount(sess)
+	if growing == 0 {
+		return
+	}
+	share := cap / uint64(growing)
+	mySize := uint64(sessions.SegmentBytes(d.sessionDir))
+	dlog.V("disk-cap sweep: sum=%d cap=%d share=%d mySize=%d growing=%d",
+		sum, cap, share, mySize, growing)
+	if sum <= cap {
+		return
+	}
+	if mySize <= share {
+		return
+	}
+	dlog.E("disk-cap: shutting down (sum=%d > cap=%d, mySize=%d > share=%d)",
+		sum, cap, mySize, share)
+	d.diskcap.Store(true)
+	d.mu.Lock()
+	d.shutdown = true
+	d.preserveOnExit = true
+	d.cond.Broadcast()
+	d.mu.Unlock()
+	d.outputBuf.Seal()
+}
+
 func (d *daemon) pumpPTY() {
 	p := make([]byte, 32*1024)
 	for {
 		n, err := d.ptmx.Read(p)
 		if n > 0 {
 			if e := d.outputBuf.Append(p[:n]); e != nil {
-				if errors.Is(e, buffer.ErrOverflow) {
-					dlog.E("output overflow at %d bytes", d.outputBuf.Len())
-					d.overflow.Store(true)
-					d.mu.Lock()
-					d.shutdown = true
-					d.preserveOnExit = true
-					d.cond.Broadcast()
-					d.mu.Unlock()
-				} else {
-					dlog.E("output append: %v", e)
-				}
+				dlog.E("output append: %v", e)
 				d.outputBuf.Seal()
 				d.wake()
 				return
@@ -951,9 +1060,9 @@ func ReplayRun(sessionID string, logLevel int) int {
 	markerPath := filepath.Join(sessionDir, cleanMarkerName)
 	_, markerErr := os.Stat(markerPath)
 	cleanShutdown := markerErr == nil
-	overflowPath := filepath.Join(sessionDir, overflowMarkerName)
-	_, overflowErr := os.Stat(overflowPath)
-	overflowShutdown := overflowErr == nil
+	diskcapPath := filepath.Join(sessionDir, diskcapMarkerName)
+	_, diskcapErr := os.Stat(diskcapPath)
+	diskcapShutdown := diskcapErr == nil
 
 	// The buffer was persisted as a series of segment files at the
 	// "output.log" prefix; enumerate them and treat the last segment's
@@ -1043,11 +1152,10 @@ func ReplayRun(sessionID string, logLevel int) int {
 	//   130 = recovery refused — the previous daemon didn't shut down
 	//         cleanly, so the on-disk buffer is suspect. Left in place
 	//         for manual recovery.
-	//   131 = the session ended because the daemon's held buffer
-	//         overflowed (typically a long disconnect with fast
-	//         output). Full buffer is recovered same as 129; the
-	//         distinct code lets the client print a more specific
-	//         message naming the cause.
+	//   134 = the session ended because the host-wide disk cap was
+	//         exceeded and this session was over its fair share. Full
+	//         buffer is recovered same as 129; the distinct code lets
+	//         the client print a more specific message.
 	// The client interprets these and prints a one-line notice AFTER its
 	// terminal reset, so the message survives alt-screen exit (htop, etc.)
 	// which would otherwise eat any inline OUTPUT-frame notice.
@@ -1063,8 +1171,8 @@ func ReplayRun(sessionID string, logLevel int) int {
 		off := hello.Output.Total
 		send := make([]byte, 64*1024)
 		exitCode = streamSegments(pc, segs, off, send)
-		if overflowShutdown && exitCode == 129 {
-			exitCode = 131
+		if diskcapShutdown && exitCode == 129 {
+			exitCode = 134
 		}
 		dlog.V("replay streamed from offset %d to %d", hello.Output.Total, totalSize)
 	}
@@ -1075,7 +1183,7 @@ func ReplayRun(sessionID string, logLevel int) int {
 
 	_ = conn.Close()
 	// Only clean up the session dir when the replay actually completed
-	// end-to-end: a successful stream (129 or 131) AND a successful
+	// end-to-end: a successful stream (129 or 134) AND a successful
 	// EXIT-frame delivery. If anything went wrong (mid-stream network
 	// drop → exitCode=1, or EXIT write failed silently because the
 	// link was already dead), leave the segments + clean marker in
@@ -1084,7 +1192,7 @@ func ReplayRun(sessionID string, logLevel int) int {
 	// outputBuf.Len() advances monotonically across attempts, so each
 	// retry covers strictly less ground until the buffered output is
 	// fully delivered.
-	streamSucceeded := exitCode == 129 || exitCode == 131
+	streamSucceeded := exitCode == 129 || exitCode == 134
 	if cleanShutdown && streamSucceeded && exitDelivered {
 		_ = os.RemoveAll(sessionDir)
 	}

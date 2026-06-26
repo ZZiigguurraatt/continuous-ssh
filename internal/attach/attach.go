@@ -9,6 +9,7 @@ package attach
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -23,6 +24,8 @@ import (
 	"github.com/zziigguurraatt/continuous-ssh/internal/buffer"
 	"github.com/zziigguurraatt/continuous-ssh/internal/daemon"
 	"github.com/zziigguurraatt/continuous-ssh/internal/dlog"
+	"github.com/zziigguurraatt/continuous-ssh/internal/proto"
+	"github.com/zziigguurraatt/continuous-ssh/internal/sessions"
 )
 
 // Run is the attach subcommand entry point.
@@ -39,6 +42,14 @@ func Run(argv []string) int {
 	}
 
 	if newMode {
+		// Pre-spawn disk-cap check. If the host-wide segment-byte
+		// total is already at or above DiskBudget, refuse to start a
+		// new session — there's no budget for the daemon to grow
+		// into. Communicate the refusal back to the client as an
+		// EXIT(135) frame written to ssh stdout, then exit.
+		if refused := refuseIfDiskCapHit(); refused {
+			return 135
+		}
 		id, err := generateSessionID()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "attach: %v\n", err)
@@ -218,6 +229,34 @@ func dialWithRetry(path string, timeout time.Duration) (net.Conn, error) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// refuseIfDiskCapHit returns true (and writes an EXIT(135) frame to
+// stdout) when total session disk usage already meets or exceeds
+// DiskBudget. The frame goes to ssh's stdout — the client reads it in
+// place of HELLO_ACK and surfaces a "cap reached" message before
+// exiting with code 135. Returns false (silently) on any error
+// reading sessions/free-disk state; better to let the session start
+// than to block on a flaky stat call.
+func refuseIfDiskCapHit() bool {
+	sess, err := sessions.List()
+	if err != nil {
+		return false
+	}
+	free, err := sessions.FreeDisk()
+	if err != nil {
+		return false
+	}
+	cap := sessions.DiskBudget(sess, free)
+	usage := sessions.TotalDiskUsage(sess)
+	if usage < cap {
+		return false
+	}
+	var p [4]byte
+	binary.BigEndian.PutUint32(p[:], 135)
+	pc := proto.NewConn(nil, os.Stdout)
+	_ = pc.WriteFrame(proto.Frame{Type: proto.Exit, Payload: p[:]})
+	return true
 }
 
 func bridge(conn net.Conn) int {

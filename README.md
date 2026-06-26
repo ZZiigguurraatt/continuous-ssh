@@ -356,7 +356,7 @@ remote attach → daemon) automatically.
 
 | Level | Flag | What's logged |
 |-------|------|--------------|
-| 0 (default) | (none) | Errors and event messages only — start/exit lines, signals, overflow notices. A few lines per session. |
+| 0 (default) | (none) | Errors and event messages only — start/exit lines, signals, disk-cap shutdowns. A few lines per session. |
 | 1 (verbose) | `--debug` | Above + session-level events: protocol negotiation, reconnects, ACK trims as a whole, signal handlers, buffer-state heartbeat every 10 s. Tens of lines per session. Also mirrors the log to stderr (CR-LF translated so it stays readable while the local terminal is in raw mode). |
 | 1 (verbose) | `--debug-file` | Same level as `--debug`, but no stderr mirror. The log path is printed to stderr once on startup so you can `tail -f` it from another shell. |
 | 2 (trace) | `--trace-file` | Above + per-frame chatter: every OUT/IN frame, every ACK sent, overlap drops. Thousands of lines per session under load. File-only (no stderr mirror — would flood the terminal). |
@@ -433,11 +433,12 @@ holds unacked output: the newest 10 MiB in RAM, the rest spilled to
 a sequence of 10 MiB segment files in
 `~/.continuous-ssh/sessions/<id>/output.log.<startOff>`. As ACKs
 arrive, `TrimTo(N)` deletes any segment whose entire range falls
-below N — so disk usage tracks *held* bytes, not cumulative output.
-Hard cap is 100 MiB of **unacked** held bytes; the daemon trims as
-the client acknowledges, so the cap is really "how much output can
-pile up during a single disconnect" not "how much output the session
-can produce in total".
+below N — so disk usage tracks **unacked** held bytes, not
+cumulative output. The host-wide DiskBudget (below) is therefore
+really "how much output can pile up across all sessions during
+their disconnects", not "how much output the sessions can produce
+in total". There is no per-session synchronous cap; DiskBudget is
+the only ceiling.
 
 **ACK-based purge during a healthy connection.** As the client
 displays output it sends `Ack(N)` frames back to the daemon (where N
@@ -452,7 +453,8 @@ steady state the daemon's held buffer stays under ~5–10 MiB.
 
 **Disconnect → reconnect.** During a disconnect the daemon stops
 receiving ACKs but the shell keeps producing output. The daemon's
-held buffer grows up to its 100 MiB cap. When the client reconnects,
+held buffer grows; the disk-cap sweeper bounds long-term growth
+across all sessions. When the client reconnects,
 it sends `HELLO` with its current total + the SHA-256 hash list of
 every complete 1 MiB chunk it has hashed. The daemon:
 
@@ -477,9 +479,56 @@ where the cut happened, so we just resend chunk N + the trailing
 partial in full. The client's byte-offset dedup quietly discards the
 overlap.
 
-If the daemon's held bytes exceed 100 MiB (a very long disconnect with
-fast output and no ACKs landing), the daemon exits and the session
-enters the recovery flow below.
+### Global disk cap
+
+A host-wide budget shared across sessions, so a fleet of growing
+sessions can't fill the disk:
+
+```
+DiskBudget = min(2 GiB, 20% × free_disk)
+           − min(100 MiB, 5% × 20% × free_disk) × N_growing
+```
+
+`N_growing` counts sessions in `active` or `stale` status — dead
+sessions don't grow and so don't reserve. The reserve per session
+caps at 100 MiB on a roomy disk but scales down (5% of the raw
+20% budget) on tight disks so the per-session reserve can never
+dominate the budget itself.
+
+Each daemon's 60 s sweeper shuts the daemon down when the sum of
+all sessions' disk usage exceeds DiskBudget AND this session is
+above its fair share. Evaluated locally with no coordination
+between daemons, fast growers volunteer first; sessions already
+under their share keep running. The rule:
+
+```
+self-shutdown iff:
+  sum_of_all_session_disk > DiskBudget
+  AND
+  my_size > DiskBudget / N_growing
+```
+
+A shutdown via this path preserves on exit: segments stay on disk,
+a `diskcap` marker file is written, and the next reconnect spawns
+a replay daemon that streams what was buffered, delivers EXIT 134,
+and removes the directory. The disk isn't reclaimed until that
+reconnect (or an explicit `xssh rm`).
+
+A new session (`xssh user@host` on a host already at or above
+DiskBudget) is refused up-front. The remote `attach` writes an
+EXIT 135 frame in place of HELLO_ACK; the client prints "cap
+reached" and exits without retrying.
+
+A one-line usage banner is appended to the output stream at
+session start:
+
+```
+continuous-ssh: buffer disk usage 21.3 MB of 1.7 GB (1%)
+```
+
+Because it's part of the session's byte stream, it lands once at
+offset 0 and isn't re-injected on reconnects (the client already
+has those bytes).
 
 ### Tunable parameters
 
@@ -489,7 +538,11 @@ visible in one place.
 
 | Parameter | Value | Defined in | What it controls |
 |-----------|-------|------------|------------------|
-| `DefaultMaxBytes` | **100 MiB** | `internal/buffer/buffer.go` | Daemon's hard cap on **held** (unacked) bytes. Exceeded → daemon exits, session goes to disk for replay. |
+| `diskCapAbsolute` | **2 GiB** | `internal/sessions/diskcap.go` | Hard ceiling on `min(2 GiB, 20% × free)` — the raw budget before the per-session reserve. |
+| `diskCapFreeRatio` | **20%** | `internal/sessions/diskcap.go` | Fraction of free-disk that bounds the budget when the disk has less than 10 GiB free. |
+| `diskCapReserveMax` | **100 MiB** | `internal/sessions/diskcap.go` | Upper bound on the per-growing-session subtraction from DiskBudget. |
+| `diskCapReserveSubRatio` | **5%** | `internal/sessions/diskcap.go` | Fraction of the raw 20% budget used as the per-session reserve when the disk is small enough that 100 MiB would dominate. |
+| `diskCapSweepInterval` | **60 s** | `internal/daemon/daemon.go` | How often each daemon evaluates the DiskBudget rule and decides whether to self-shutdown. |
 | `DefaultRAMTail` | **10 MiB** | `internal/buffer/buffer.go` | Daemon's in-RAM window; older held bytes spill to segment files. |
 | `DefaultSegmentSize` | **10 MiB** | `internal/buffer/buffer.go` | Size of each on-disk segment file. Rotated when full; deleted when fully trimmed by ACKs. |
 | `clientBufRAM` | **10 MiB** | `internal/client/client.go` | Client's RAM-only sliding window; older bytes drop off the back (local terminal scrollback is the real history). |
@@ -516,6 +569,8 @@ output.log.<off>  disk spill — one or more 10 MiB segment files, deleted as
 daemon.log   daemon log file
 attach.log   attach log file
 clean         written only when the daemon shut down with a complete flush
+diskcap       written next to `clean` when the daemon stopped because the
+              host-wide disk cap was exceeded; replay delivers EXIT(134).
 ```
 
 What the daemon does with this directory on exit depends on **why** it's
@@ -527,7 +582,7 @@ exiting, and (for the signal case) on whether a client is connected:
 | Client sends `SHUTDOWN` (user hit `~.`) | Whole directory removed. |
 | `SIGTERM`/`SIGINT`/`SIGHUP` *with* an active client | Daemon kills the remote shell, drains the buffer to the client, sends `EXIT(129)`. Client exits cleanly. Whole directory removed — the client has everything. |
 | `SIGTERM`/`SIGINT`/`SIGHUP` *without* an active client | RAM tail flushed to a fresh segment; `sock`/`pid`/`info` removed; segment files + `clean` marker kept for the next reconnect to replay. |
-| Output buffer overflows (>100 MiB unacked) | Preserved like the no-client signal case. |
+| Host-wide disk cap exceeded (this session above fair share) | Preserved like the no-client signal case; a `diskcap` marker is dropped alongside `clean` so the replay daemon delivers EXIT(134). |
 | Hard kill (`SIGKILL`, OOM, power loss) | Daemon never gets to flush. Segments are whatever spilled before death; **no `clean` marker** is written. |
 
 ## Recovery / replay
@@ -572,10 +627,12 @@ List every session directory under `~/.continuous-ssh/sessions/`:
 
 ```
 $ xssh ls
-  SESSION ID                          STATUS   PID      DISK BUF    LAST CHANGE              STARTED
-* ab12cd34ef56789012ab34cd56ef7890    active   12345    0           connected    (12m ago)   2026-06-25 14:02 (12m ago)
-  98fe76dc54ba32108765edcb432109af    stale    12380    21.0 MB     disconnected ( 5m ago)   2026-06-25 14:09 ( 5m ago)
-  deadc0de87654321fedcba0987654321    dead     -        100.0 MB    disconnected (44m ago)   2026-06-25 13:30 (44m ago)
+  SESSION ID                          STATUS   PID      DISK BUF         LAST CHANGE              STARTED
+* ab12cd34ef56789012ab34cd56ef7890    active   12345           0 (  0%)  connected    (12m ago)   2026-06-25 14:02 (12m ago)
+  98fe76dc54ba32108765edcb432109af    stale    12380     21.0 MB (  1%)  disconnected ( 5m ago)   2026-06-25 14:09 ( 5m ago)
+  deadc0de87654321fedcba0987654321    dead     -        100.0 MB (  6%)  disconnected (44m ago)   2026-06-25 13:30 (44m ago)
+
+Buffer: 121.0 MB of 1.7 GB DiskBudget (7%) · Disk: 50.0 GB free of 100.0 GB (50%)
 ```
 
 Columns:
@@ -587,9 +644,12 @@ Columns:
 - **STATUS**: see table below.
 - **PID**: daemon PID, or `-` for dead sessions.
 - **DISK BUF**: total bytes across all `output.log.<offset>` segment
-  files. Normally `0` for a healthy active session (RAM tail isn't
+  files, followed by what percentage of DiskBudget that occupies.
+  Normally `0` for a healthy active session (RAM tail isn't
   exceeded). Grows during a disconnect; shrinks again on reconnect as
-  ACKs trim segments away.
+  ACKs trim segments away. The percentage reflects the same
+  denominator as the daemon's startup banner, so the numbers line up
+  with the sweep rule.
 - **LAST CHANGE**: the most recent attach/detach event and how long
   ago it happened. `connected (X ago)` for an active session means
   the current client connected X ago and is still attached;
@@ -694,8 +754,9 @@ the connection without setting up any streams.
 | `0`  | Remote shell exited cleanly (user typed `exit`, or your command finished). |
 | `129`| Remote daemon was stopped by signal (signal-induced shutdown, or successful replay of a signal-preserved session). Client prints `continuous-ssh: remote daemon stopped.` |
 | `130`| User aborted with `~.` (prints `Connection aborted.`), **or** replay was refused because the previous daemon didn't shut down cleanly (prints the "not cleanly shut down" message above). |
-| `131`| Remote daemon stopped because its held output buffer hit the 100 MiB cap (typically a long disconnect with fast output). Buffer was preserved and replayed successfully. Client prints `continuous-ssh: remote daemon stopped because its output buffer filled (long disconnect with fast output).` |
 | `132`| Protocol-version mismatch between local and remote xssh binaries. Client prints `continuous-ssh: incompatible protocol (local=X.Y, remote=A.B). Re-deploy the matching xssh binary to the remote.` Major-version differences are fatal; same-major minor differences are accepted silently. |
+| `134`| Remote daemon shut itself down because the host-wide disk cap was exceeded and this session was above its fair share (typically a long disconnect with fast output). Buffer was preserved and replayed successfully. Client prints `continuous-ssh: remote daemon stopped because the host-wide disk cap was exceeded (long disconnect with fast output).` |
+| `135`| New session refused before it could start: the host-wide disk cap is already at or above DiskBudget. Client prints `continuous-ssh: cannot start new session — the host-wide disk cap is reached.` |
 | other| Underlying ssh / command exit code, passed through. |
 
 ## Smoke tests
@@ -754,29 +815,30 @@ Notes on the recipe:
   attempt takes ~21 s of TCP-SYN timeout, so you have ~100 s of
   budget before that fires.
 
-**Test B — daemon overflow + replay (destroys the session)**
+**Test B — disk-cap shutdown + replay (destroys the session)**
 
 ```
 xssh user@host
-sleep 20; seq 1 50000000         # ~430 MiB once seq starts; won't finish before overflow
+sleep 20; seq 1 250000000        # ~2.1 GiB once seq starts; trips DiskBudget
 ```
 
 The `sleep 20` gives you 20 s to switch to another shell and stage
 the disable-network command. As `seq` is running, **disable networking
-to the remote and leave it down** for 30–60 seconds. The remote daemon's held bytes will cross
-100 MiB, it'll exit preserving on-disk state. Re-enable networking;
-the client reconnects, the replay daemon serves the buffered output,
-and the session ends with:
+to the remote and leave it down** long enough for the sweeper (60 s
+interval) to detect that the session's disk usage has crossed its
+fair-share line. The daemon writes the `diskcap` marker and exits
+preserving on-disk state. Re-enable networking; the client
+reconnects, the replay daemon serves the buffered output, and the
+session ends with:
 
 ```
-continuous-ssh: remote daemon stopped.
+continuous-ssh: remote daemon stopped because the host-wide disk cap was exceeded.
 ```
 
-and exit code `129`.
+and exit code `134`.
 
-Exercises: daemon overflow path, on-disk preservation + `clean`
-marker, replay daemon, `EXIT(129)` message, terminal restore on the
-129 path.
+Exercises: disk-cap sweeper, `diskcap` marker, on-disk preservation,
+replay daemon, `EXIT(134)` message, terminal restore on the 134 path.
 
 **Minimal regression check**: just run **Test A**. It triggers the
 case that motivated the buffer rewrite; Test B destroys the session

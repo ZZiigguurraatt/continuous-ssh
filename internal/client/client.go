@@ -79,7 +79,7 @@ func Run(argv []string) int {
 	// past bytes that fall off the window are still tracked by the byte
 	// counter (Buffer.Len) so dedup on reconnect works by offset alone.
 	const clientBufRAM uint64 = 10 << 20
-	outputBuf, err := buffer.New("", clientBufRAM, 0, 0, clientBufRAM)
+	outputBuf, err := buffer.New("", clientBufRAM, 0, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "continuous-ssh: %v\n", err)
 		return 1
@@ -161,11 +161,13 @@ func Run(argv []string) int {
 			msg = "continuous-ssh: remote daemon stopped."
 		case 130:
 			msg = "continuous-ssh: session was not cleanly shut down; recovery aborted."
-		case 131:
-			msg = "continuous-ssh: remote daemon stopped because its output buffer filled (long disconnect with fast output)."
 		case 132:
 			msg = fmt.Sprintf("continuous-ssh: incompatible protocol (local=%d.%d, remote=%d.%d). Re-deploy the matching xssh binary to the remote.",
 				proto.ProtocolMajor, proto.ProtocolMinor, c.remoteMajor, c.remoteMinor)
+		case 134:
+			msg = "continuous-ssh: remote daemon stopped because the host-wide disk cap was exceeded (long disconnect with fast output). Run `xssh rm` on the remote to free space."
+		case 135:
+			msg = "continuous-ssh: cannot start new session — the host-wide disk cap is reached. Connect with plain ssh and run `xssh rm` to free space."
 		}
 		if msg != "" {
 			// Emit a bare CR (no LF) before the message: returns the
@@ -568,6 +570,20 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		c.killSSH(sshCmd)
 		stderrWG.Wait()
 		return runResult{}
+	}
+	// Attach can refuse a `--new` session up-front (currently used
+	// when the global disk-cap is at or above DiskBudget) by writing
+	// an EXIT frame instead of HELLO_ACK. We treat that as fatal —
+	// no retry loop will fix a host-wide policy decision.
+	if ack.Type == proto.Exit {
+		code := 0
+		if len(ack.Payload) >= 4 {
+			code = int(int32(binary.BigEndian.Uint32(ack.Payload[:4])))
+		}
+		dlog.E("EXIT received in HELLO_ACK position code=%d", code)
+		c.killSSH(sshCmd)
+		stderrWG.Wait()
+		return runResult{exit: true, exitCode: code}
 	}
 	if ack.Type != proto.HelloAck {
 		dlog.E("expected HELLO_ACK got %s", ack.Type)
