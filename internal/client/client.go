@@ -159,6 +159,8 @@ func Run(argv []string) int {
 			msg = "continuous-ssh: remote daemon stopped."
 		case 130:
 			msg = "continuous-ssh: session was not cleanly shut down; recovery aborted."
+		case 131:
+			msg = "continuous-ssh: remote daemon stopped because its output buffer filled (long disconnect with fast output)."
 		}
 		if msg != "" {
 			// Emit a bare CR (no LF) before the message: returns the

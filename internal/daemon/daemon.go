@@ -226,6 +226,17 @@ func Run(argv []string) int {
 			if werr := os.WriteFile(markerPath, nil, 0o600); werr != nil {
 				dlog.E("write clean marker: %v", werr)
 			}
+			// Overflow marker alongside the clean marker lets the
+			// replay daemon distinguish "daemon stopped because of
+			// signal" (default 129 + generic message) from "daemon
+			// stopped because the held buffer hit its cap" (more
+			// specific message for the user).
+			if d.overflow.Load() {
+				overflowPath := filepath.Join(sessionDir, overflowMarkerName)
+				if werr := os.WriteFile(overflowPath, nil, 0o600); werr != nil {
+					dlog.E("write overflow marker: %v", werr)
+				}
+			}
 		} else {
 			dlog.E("not writing clean marker: buffer flush failed")
 		}
@@ -375,6 +386,12 @@ type daemon struct {
 // daemon shuts down cleanly with its RAM tail successfully flushed to
 // disk. The replay daemon refuses to serve a session that lacks it.
 const cleanMarkerName = "clean"
+
+// overflowMarkerName is written next to the clean marker when the
+// daemon shut down because the held buffer hit its cap. The replay
+// daemon promotes EXIT(129) → EXIT(131) when it sees this so the
+// client can print a more specific message.
+const overflowMarkerName = "overflow"
 
 const keepAliveGrace = 30 * time.Second
 
@@ -883,6 +900,9 @@ func ReplayRun(sessionID string, debug bool) int {
 	markerPath := filepath.Join(sessionDir, cleanMarkerName)
 	_, markerErr := os.Stat(markerPath)
 	cleanShutdown := markerErr == nil
+	overflowPath := filepath.Join(sessionDir, overflowMarkerName)
+	_, overflowErr := os.Stat(overflowPath)
+	overflowShutdown := overflowErr == nil
 
 	// The buffer was persisted as a series of segment files at the
 	// "output.log" prefix; enumerate them and treat the last segment's
@@ -968,10 +988,15 @@ func ReplayRun(sessionID string, debug bool) int {
 
 	// Exit codes are the contract with the client:
 	//   129 = the session ended because the remote daemon was stopped
-	//         (clean shutdown, full buffer recovered).
+	//         by signal (clean shutdown, full buffer recovered).
 	//   130 = recovery refused — the previous daemon didn't shut down
 	//         cleanly, so the on-disk buffer is suspect. Left in place
 	//         for manual recovery.
+	//   131 = the session ended because the daemon's held buffer
+	//         overflowed (typically a long disconnect with fast
+	//         output). Full buffer is recovered same as 129; the
+	//         distinct code lets the client print a more specific
+	//         message naming the cause.
 	// The client interprets these and prints a one-line notice AFTER its
 	// terminal reset, so the message survives alt-screen exit (htop, etc.)
 	// which would otherwise eat any inline OUTPUT-frame notice.
@@ -987,6 +1012,9 @@ func ReplayRun(sessionID string, debug bool) int {
 		off := hello.Output.Total
 		send := make([]byte, 64*1024)
 		exitCode = streamSegments(pc, segs, off, send)
+		if overflowShutdown && exitCode == 129 {
+			exitCode = 131
+		}
 		dlog.V("replay streamed from offset %d to %d", hello.Output.Total, totalSize)
 	}
 

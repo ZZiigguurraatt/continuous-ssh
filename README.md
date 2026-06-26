@@ -586,8 +586,9 @@ The one-step shortcut for the same effect is `xssh rm --kill --active`.
 | Code | Meaning |
 |------|---------|
 | `0`  | Remote shell exited cleanly (user typed `exit`, or your command finished). |
-| `129`| Remote daemon was stopped (signal-induced shutdown, or successful replay of a preserved session). Client prints `continuous-ssh: remote daemon stopped.` |
+| `129`| Remote daemon was stopped by signal (signal-induced shutdown, or successful replay of a signal-preserved session). Client prints `continuous-ssh: remote daemon stopped.` |
 | `130`| User aborted with `~.` (prints `Connection aborted.`), **or** replay was refused because the previous daemon didn't shut down cleanly (prints the "not cleanly shut down" message above). |
+| `131`| Remote daemon stopped because its held output buffer hit the 100 MiB cap (typically a long disconnect with fast output). Buffer was preserved and replayed successfully. Client prints `continuous-ssh: remote daemon stopped because its output buffer filled (long disconnect with fast output).` |
 | other| Underlying ssh / command exit code, passed through. |
 
 ## Smoke tests
