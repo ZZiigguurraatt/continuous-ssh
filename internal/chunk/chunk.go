@@ -27,9 +27,13 @@ const (
 )
 
 // Manifest is one side's view of the output stream for reconciliation.
+// Hashes[i] is the hash of the absolute chunk (FirstIndex+i); each
+// side may have trimmed a different prefix of its hashes, so the
+// reconciliation has to align by absolute index.
 type Manifest struct {
-	Total  uint64
-	Hashes []buffer.Hash
+	Total      uint64
+	FirstIndex uint64
+	Hashes     []buffer.Hash
 }
 
 // Hello is the structured payload of a HELLO or HELLO_ACK frame.
@@ -62,12 +66,11 @@ func (h *Hello) Encode() ([]byte, error) {
 	}
 	payload := []byte{major, minor, byte(h.Mode), byte(len(h.SessionID))}
 	payload = append(payload, []byte(h.SessionID)...)
-	if uint64(len(h.Output.Hashes))*buffer.DefaultChunkSize > h.Output.Total {
-		return nil, fmt.Errorf("chunk: hash count exceeds total bytes")
-	}
-	var hdr [12]byte
+	// Manifest header: total (8) + firstIndex (8) + hashCount (4) = 20 bytes.
+	var hdr [20]byte
 	binary.BigEndian.PutUint64(hdr[0:8], h.Output.Total)
-	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(h.Output.Hashes)))
+	binary.BigEndian.PutUint64(hdr[8:16], h.Output.FirstIndex)
+	binary.BigEndian.PutUint32(hdr[16:20], uint32(len(h.Output.Hashes)))
 	payload = append(payload, hdr[:]...)
 	for _, hash := range h.Output.Hashes {
 		payload = append(payload, hash[:]...)
@@ -96,17 +99,18 @@ func DecodeHello(p []byte) (*Hello, error) {
 	}
 	h.SessionID = string(p[:sidLen])
 	p = p[sidLen:]
-	if len(p) < 12 {
+	if len(p) < 20 {
 		return nil, errors.New("chunk: hello manifest header truncated")
 	}
 	total := binary.BigEndian.Uint64(p[0:8])
-	n := int(binary.BigEndian.Uint32(p[8:12]))
-	p = p[12:]
+	firstIndex := binary.BigEndian.Uint64(p[8:16])
+	n := int(binary.BigEndian.Uint32(p[16:20]))
+	p = p[20:]
 	hashSize := len(buffer.Hash{})
 	if len(p) < n*hashSize {
 		return nil, errors.New("chunk: hello hashes truncated")
 	}
-	m := Manifest{Total: total, Hashes: make([]buffer.Hash, n)}
+	m := Manifest{Total: total, FirstIndex: firstIndex, Hashes: make([]buffer.Hash, n)}
 	for j := 0; j < n; j++ {
 		copy(m.Hashes[j][:], p[:hashSize])
 		p = p[hashSize:]
@@ -115,27 +119,49 @@ func DecodeHello(p []byte) (*Hello, error) {
 	return h, nil
 }
 
-// ResendFrom returns the byte offset at which `own` should begin retransmitting
-// data to `peer`. The result is min(first-divergent-chunk-offset,
-// last-complete-chunk-offset) so that the trailing chunk + tail is always
-// retransmitted.
+// ResendFrom returns the byte offset at which `own` should begin
+// retransmitting data to `peer`. The result is the lower of:
+//
+//	(a) the first divergent absolute-chunk-index, scaled by chunkSize, and
+//	(b) the start of `own`'s last complete chunk
+//
+// so that the trailing chunk + tail is always retransmitted (the
+// ragged-edge guard).
+//
+// Each manifest carries a FirstIndex because trimming may have dropped
+// a prefix of hashes from one or both sides. We only compare hashes
+// in the absolute-index range that BOTH sides still have, which is
+// [max(own.First, peer.First), min(own.End, peer.End)). Any divergence
+// outside that range can't be detected — but in practice the trimmed
+// prefix has already been ACKed by the client and is no longer
+// retransmittable anyway, so it doesn't matter.
 func ResendFrom(own, peer Manifest, chunkSize uint64) uint64 {
-	common := len(peer.Hashes)
-	if common > len(own.Hashes) {
-		common = len(own.Hashes)
+	ownStart := own.FirstIndex
+	peerStart := peer.FirstIndex
+	ownEnd := ownStart + uint64(len(own.Hashes))
+	peerEnd := peerStart + uint64(len(peer.Hashes))
+
+	startIndex := ownStart
+	if peerStart > startIndex {
+		startIndex = peerStart
 	}
-	divergent := common
-	for i := 0; i < common; i++ {
-		if own.Hashes[i] != peer.Hashes[i] {
+	endIndex := ownEnd
+	if peerEnd < endIndex {
+		endIndex = peerEnd
+	}
+
+	divergent := endIndex // assume all matched in the overlap
+	for i := startIndex; i < endIndex; i++ {
+		if own.Hashes[i-ownStart] != peer.Hashes[i-peerStart] {
 			divergent = i
 			break
 		}
 	}
-	fromDivergent := uint64(divergent) * chunkSize
+	fromDivergent := divergent * chunkSize
 
 	var lastChunkStart uint64
-	if n := len(own.Hashes); n > 0 {
-		lastChunkStart = uint64(n-1) * chunkSize
+	if ownEnd > 0 {
+		lastChunkStart = (ownEnd - 1) * chunkSize
 	}
 	if lastChunkStart < fromDivergent {
 		return lastChunkStart

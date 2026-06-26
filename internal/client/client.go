@@ -934,8 +934,9 @@ func (c *client) forwardStdin(ctx context.Context, pc *proto.Conn, stdinCh <-cha
 
 func manifestOf(b *buffer.Buffer) chunk.Manifest {
 	return chunk.Manifest{
-		Total:  b.Len(),
-		Hashes: b.ChunkHashes(),
+		Total:      b.Len(),
+		FirstIndex: b.FirstChunkIndex(),
+		Hashes:     b.ChunkHashes(),
 	}
 }
 

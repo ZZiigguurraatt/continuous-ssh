@@ -71,8 +71,15 @@ type Buffer struct {
 	segments   []*segment // ordered oldest→newest; last is the active write target
 
 	chunkHashes []Hash
-	curHasher   hash.Hash
-	curBytes    uint64
+	// firstChunkIndex is the absolute chunk index of chunkHashes[0]. As
+	// TrimTo advances past chunk boundaries, hashes for fully-trimmed
+	// chunks get dropped from the slice and firstChunkIndex advances by
+	// the same count — so the slice's memory and the HELLO manifest's
+	// wire size stay bounded by held-bytes/chunkSize instead of growing
+	// monotonically with cumulative output.
+	firstChunkIndex uint64
+	curHasher       hash.Hash
+	curBytes        uint64
 
 	// trimOffset is the lowest byte offset still logically held. Bytes
 	// below it have been freed (segments deleted by TrimTo, RAM slid
@@ -452,6 +459,21 @@ func (b *Buffer) TrimTo(off uint64) {
 		b.mem = b.mem[:uint64(len(b.mem))-drop]
 		b.memOffset = off
 	}
+
+	// Drop chunk hashes for chunks fully below the trim point. A chunk
+	// is "fully below" when (chunkIndex+1) * chunkSize <= trimOffset,
+	// i.e. chunkIndex < trimOffset / chunkSize. Hashes for the
+	// partial trailing chunk (curBytes < chunkSize) stay in
+	// curHasher, not in chunkHashes, so no special handling here.
+	threshold := off / b.chunkSize
+	if threshold > b.firstChunkIndex {
+		drop := threshold - b.firstChunkIndex
+		if drop > uint64(len(b.chunkHashes)) {
+			drop = uint64(len(b.chunkHashes))
+		}
+		b.chunkHashes = b.chunkHashes[drop:]
+		b.firstChunkIndex += drop
+	}
 }
 
 // ChunkSize reports the configured chunk size.
@@ -459,14 +481,26 @@ func (b *Buffer) ChunkSize() uint64 {
 	return b.chunkSize
 }
 
-// ChunkHashes returns a copy of the hashes for every complete chunk.
-// The trailing partial chunk (if any) is not represented.
+// ChunkHashes returns a copy of the hashes for currently-held complete
+// chunks. The trailing partial chunk (if any) is not represented.
+// Hashes for chunks fully trimmed by TrimTo are no longer in the
+// slice; pair this with FirstChunkIndex to interpret the result.
 func (b *Buffer) ChunkHashes() []Hash {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := make([]Hash, len(b.chunkHashes))
 	copy(out, b.chunkHashes)
 	return out
+}
+
+// FirstChunkIndex returns the absolute chunk index that ChunkHashes()[0]
+// corresponds to. ChunkHashes()[i] is the hash of chunk
+// (FirstChunkIndex + i) — useful for HELLO manifest reconciliation
+// when each side may have trimmed a different prefix.
+func (b *Buffer) FirstChunkIndex() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.firstChunkIndex
 }
 
 // TailOffset returns the offset where the trailing partial chunk starts.

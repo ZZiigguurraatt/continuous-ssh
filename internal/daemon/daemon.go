@@ -851,8 +851,9 @@ func (d *daemon) readUpstream(pc *proto.Conn) {
 
 func manifestOf(b *buffer.Buffer) chunk.Manifest {
 	return chunk.Manifest{
-		Total:  b.Len(),
-		Hashes: b.ChunkHashes(),
+		Total:      b.Len(),
+		FirstIndex: b.FirstChunkIndex(),
+		Hashes:     b.ChunkHashes(),
 	}
 }
 
