@@ -75,6 +75,18 @@ network changes rather than needing to be re-established by this tool.
   back. Only the remote shell's *output* is preserved and replayed.
 - **Don't use X11 forwarding (or agent / port forwarding) with this
   wrapper, it won't survive restarts.**
+- **No MOTD / login banner.** The message-of-the-day you'd normally see
+  on `ssh host` is not printed. It isn't `-T` (no-PTY) that suppresses
+  it — it's that the wrapper hands ssh a *remote command*
+  (`ssh -T … xssh attach …`), so sshd runs a non-interactive exec rather
+  than a login shell. sshd's `PrintMotd` path only fires for an
+  interactive login shell, and PAM's `pam_motd` is likewise out of the
+  picture: the daemon spawns your login shell directly (no `login(1)`/PAM
+  in the chain). Even if either *did* emit, the bytes would land on the
+  stdout of `xssh attach`, which the client consumes as its wire protocol
+  — they'd corrupt the stream, not render in your terminal. If you rely on
+  the MOTD, read it some other way (e.g. `cat /etc/motd` / `cat
+  /run/motd.dynamic` once connected).
 
 ## Build & install
 
