@@ -420,7 +420,7 @@ the session ends, so they don't accumulate).
   still running and the session resumes transparently. If instead the
   daemon is gone but a `clean` marker is on disk (host rebooted
   between sleep and resume, etc.), the replay daemon spawned by
-  `attach` serves the preserved buffer and delivers EXIT(129) (or
+  `attach` serves the preserved buffer and delivers EXIT(133) (or
   EXIT(134) for a disk-cap shutdown) which terminates the loop. One
   caveat: if the session directory is removed externally (`xssh rm`)
   while the client is mid-retry, the client will loop forever —
@@ -649,11 +649,12 @@ segment files concatenate in name order to reconstruct the stream).
 When replay succeeds (clean marker present), the client prints:
 
 ```
-continuous-ssh: remote daemon stopped.
+continuous-ssh: remote daemon stopped while disconnected; buffered output replayed.
 ```
 
-…and exits. The session id is now dead; further attempts to reconnect
-to it would find nothing on disk.
+…and exits with status 133 (or 134 if a `diskcap` marker was alongside
+the `clean` marker). The session id is now dead; further attempts to
+reconnect to it would find nothing on disk.
 
 ## Managing sessions on the remote
 
@@ -792,7 +793,8 @@ the connection without setting up any streams.
 |------|---------|
 | `0`  | Remote shell exited cleanly (user typed `exit`, or your command finished). |
 | `1`  | First-connect failure — ssh couldn't establish the initial session (wrong host, auth failure, remote `xssh` binary missing, etc). Client prints `continuous-ssh: initial connection failed` followed by ssh's own stderr. Not retried; re-run after fixing the underlying issue. |
-| `129`| Remote daemon was stopped by signal (signal-induced shutdown, or successful replay of a signal-preserved session). Client prints `continuous-ssh: remote daemon stopped.` |
+| `129`| Remote daemon was stopped by signal while the client was connected (live signal-induced shutdown). Client prints `continuous-ssh: remote daemon stopped.` |
+| `133`| Replay-recovered counterpart to 129: the daemon stopped by signal while no client was attached, and the replay daemon just streamed its preserved buffer to you. Client prints `continuous-ssh: remote daemon stopped while disconnected; buffered output replayed.` |
 | `130`| User aborted with `~.` (prints `Connection aborted.`), **or** replay was refused because the previous daemon didn't shut down cleanly (prints the "not cleanly shut down" message above). |
 | `132`| Protocol-version mismatch between local and remote xssh binaries. Client prints `continuous-ssh: incompatible protocol (local=X.Y, remote=A.B). Re-deploy the matching xssh binary to the remote.` Major-version differences are fatal; same-major minor differences are accepted silently. |
 | `134`| Remote daemon shut itself down because the host-wide disk cap was exceeded and this session was above its fair share (typically a long disconnect with fast output). Buffer was preserved and replayed successfully. Client prints `continuous-ssh: remote daemon stopped because the host-wide disk cap was exceeded (long disconnect with fast output).` |

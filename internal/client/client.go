@@ -160,6 +160,8 @@ func Run(argv []string) int {
 		switch code {
 		case 129:
 			msg = "continuous-ssh: remote daemon stopped."
+		case 133:
+			msg = "continuous-ssh: remote daemon stopped while disconnected; buffered output replayed."
 		case 130:
 			msg = "continuous-ssh: session was not cleanly shut down; recovery aborted."
 		case 132:

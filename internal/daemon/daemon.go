@@ -1147,15 +1147,15 @@ func ReplayRun(sessionID string, logLevel int) int {
 	}
 
 	// Exit codes are the contract with the client:
-	//   129 = the session ended because the remote daemon was stopped
-	//         by signal (clean shutdown, full buffer recovered).
 	//   130 = recovery refused — the previous daemon didn't shut down
 	//         cleanly, so the on-disk buffer is suspect. Left in place
 	//         for manual recovery.
-	//   134 = the session ended because the host-wide disk cap was
-	//         exceeded and this session was over its fair share. Full
-	//         buffer is recovered same as 129; the distinct code lets
-	//         the client print a more specific message.
+	//   133 = the previous daemon stopped by signal earlier (while no
+	//         client was connected) and we just replayed its preserved
+	//         buffer. The replay-side counterpart to the live 129.
+	//   134 = same as 133 but the previous shutdown was a host-wide
+	//         disk-cap shutdown — the diskcap marker upgrades 133 to
+	//         134 so the client can print a more specific message.
 	// The client interprets these and prints a one-line notice AFTER its
 	// terminal reset, so the message survives alt-screen exit (htop, etc.)
 	// which would otherwise eat any inline OUTPUT-frame notice.
@@ -1171,8 +1171,16 @@ func ReplayRun(sessionID string, logLevel int) int {
 		off := hello.Output.Total
 		send := make([]byte, 64*1024)
 		exitCode = streamSegments(pc, segs, off, send)
-		if diskcapShutdown && exitCode == 129 {
+		// streamSegments returns 129 on success. Promote it to 133
+		// (replay-recovered) so the client can distinguish "daemon
+		// stopped just now" (live 129) from "daemon stopped while
+		// the client was disconnected, and we just replayed it"
+		// (133). A diskcap marker further promotes 133 → 134.
+		switch {
+		case exitCode == 129 && diskcapShutdown:
 			exitCode = 134
+		case exitCode == 129:
+			exitCode = 133
 		}
 		dlog.V("replay streamed from offset %d to %d", hello.Output.Total, totalSize)
 	}
@@ -1192,7 +1200,7 @@ func ReplayRun(sessionID string, logLevel int) int {
 	// outputBuf.Len() advances monotonically across attempts, so each
 	// retry covers strictly less ground until the buffered output is
 	// fully delivered.
-	streamSucceeded := exitCode == 129 || exitCode == 134
+	streamSucceeded := exitCode == 133 || exitCode == 134
 	if cleanShutdown && streamSucceeded && exitDelivered {
 		_ = os.RemoveAll(sessionDir)
 	}
