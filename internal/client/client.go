@@ -5,6 +5,7 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -395,17 +396,29 @@ func (c *client) run() int {
 			c.aborted = true
 			return 130
 		}
+		// First-connect failures don't retry — there's nothing yet to
+		// reconnect to, and silently re-attempting would mask real
+		// problems (wrong host, ssh auth failure, remote xssh binary
+		// missing). Surface ssh's own diagnostic and exit. Past the
+		// first successful HELLO_ACK the retry budget below kicks in.
+		if first {
+			msg := strings.TrimSpace(result.sshStderr)
+			if msg != "" {
+				fmt.Fprintf(os.Stderr, "continuous-ssh: initial connection failed\n%s\n", msg)
+			} else {
+				fmt.Fprintln(os.Stderr, "continuous-ssh: initial connection failed")
+			}
+			return 1
+		}
 		// Safety net: if the session id is set (we've connected before)
 		// and a sequence of reconnect attempts is failing without ever
 		// producing an EXIT, assume the session is truly gone — the
 		// replay daemon may have cleaned up the session dir already —
 		// and bail with the standard "remote daemon stopped" notice.
-		if c.sessionID != "" {
-			consecutiveFails++
-			if consecutiveFails >= 5 {
-				dlog.E("giving up after %d failed reconnects to session %s", consecutiveFails, c.sessionID)
-				return 129
-			}
+		consecutiveFails++
+		if consecutiveFails >= 5 {
+			dlog.E("giving up after %d failed reconnects to session %s", consecutiveFails, c.sessionID)
+			return 129
 		}
 		dlog.V("reconnect: backing off (consecutiveFails=%d)", consecutiveFails)
 		select {
@@ -498,6 +511,12 @@ func (c *client) sendResize() {
 type runResult struct {
 	exit     bool
 	exitCode int
+	// sshStderr captures whatever ssh wrote to its own stderr during
+	// this attempt — the underlying connection failure reason, in
+	// ssh's own words ("Permission denied (publickey)", "Could not
+	// resolve hostname …", etc). Populated on every return so the
+	// caller can surface it when a first-connect attempt fails.
+	sshStderr string
 }
 
 func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte, activate func() error) runResult {
@@ -515,29 +534,41 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		return runResult{}
 	}
 
-	var stderrWG sync.WaitGroup
-	if c.debug {
-		stderrPipe, perr := sshCmd.StderrPipe()
-		if perr != nil {
-			dlog.E("ssh stderr pipe: %v", perr)
-			return runResult{}
-		}
-		stderrWG.Add(1)
-		go func() {
-			defer stderrWG.Done()
-			scan := bufio.NewScanner(stderrPipe)
-			for scan.Scan() {
-				dlog.V("ssh stderr: %s", scan.Text())
-			}
-		}()
-	} else {
-		sshCmd.Stderr = io.Discard
+	// Always capture ssh's stderr into a bounded buffer so a
+	// first-connect failure can surface ssh's own diagnostic
+	// ("Permission denied (publickey)", "Could not resolve hostname",
+	// etc.) instead of a generic message. In debug mode the captured
+	// lines are also mirrored to dlog. The reader goroutine is
+	// started AFTER sshCmd.Start so a Start failure can't leave a
+	// goroutine blocked reading from an orphaned pipe.
+	stderrPipe, perr := sshCmd.StderrPipe()
+	if perr != nil {
+		dlog.E("ssh stderr pipe: %v", perr)
+		return runResult{}
 	}
+	var stderrBuf bytes.Buffer
+	var stderrWG sync.WaitGroup
+	const maxStderrCapture = 8 << 10 // 8 KiB is plenty for ssh diagnostics
 
 	if err := sshCmd.Start(); err != nil {
 		dlog.E("ssh start: %v", err)
-		return runResult{}
+		return runResult{sshStderr: err.Error()}
 	}
+	stderrWG.Add(1)
+	go func() {
+		defer stderrWG.Done()
+		scan := bufio.NewScanner(stderrPipe)
+		for scan.Scan() {
+			line := scan.Text()
+			if c.debug {
+				dlog.V("ssh stderr: %s", line)
+			}
+			if stderrBuf.Len() < maxStderrCapture {
+				stderrBuf.WriteString(line)
+				stderrBuf.WriteByte('\n')
+			}
+		}
+	}()
 
 	pc := proto.NewConn(sshStdout, sshStdin)
 
@@ -554,14 +585,14 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		dlog.E("hello encode: %v", err)
 		c.killSSH(sshCmd)
 		stderrWG.Wait()
-		return runResult{}
+		return runResult{sshStderr: stderrBuf.String()}
 	}
 	dlog.V("sending HELLO mode=%d outputTotal=%d", mode, c.outputBuf.Len())
 	if err := pc.WriteFrame(proto.Frame{Type: proto.Hello, Payload: helloPayload}); err != nil {
 		dlog.E("hello write: %v", err)
 		c.killSSH(sshCmd)
 		stderrWG.Wait()
-		return runResult{}
+		return runResult{sshStderr: stderrBuf.String()}
 	}
 
 	ack, err := pc.ReadFrame()
@@ -569,7 +600,7 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		dlog.E("hello_ack read: %v", err)
 		c.killSSH(sshCmd)
 		stderrWG.Wait()
-		return runResult{}
+		return runResult{sshStderr: stderrBuf.String()}
 	}
 	// Attach can refuse a `--new` session up-front (currently used
 	// when the global disk-cap is at or above DiskBudget) by writing
@@ -589,14 +620,14 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		dlog.E("expected HELLO_ACK got %s", ack.Type)
 		c.killSSH(sshCmd)
 		stderrWG.Wait()
-		return runResult{}
+		return runResult{sshStderr: stderrBuf.String()}
 	}
 	ackHello, err := chunk.DecodeHello(ack.Payload)
 	if err != nil {
 		dlog.E("hello_ack decode: %v", err)
 		c.killSSH(sshCmd)
 		stderrWG.Wait()
-		return runResult{}
+		return runResult{sshStderr: stderrBuf.String()}
 	}
 	// Protocol-version check. Major mismatch is fatal — there's no
 	// point retrying because the remote binary is what needs replacing.
@@ -637,7 +668,7 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		dlog.E("activate raw mode: %v", err)
 		c.killSSH(sshCmd)
 		stderrWG.Wait()
-		return runResult{}
+		return runResult{sshStderr: stderrBuf.String()}
 	}
 
 	// This session is now active. Hand it to SIGWINCH and send the initial

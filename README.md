@@ -353,12 +353,18 @@ this wrapper).
 
 ## Initial connect
 
-Until the first `HELLO_ACK` lands, the local terminal stays in cooked
+Until the first `HELLO_ACK` lands, the local terminal stays in "cooked"
 mode. **Ctrl-C** during this window exits the client cleanly — useful
-if the very first connect is hanging or failing in a loop. Once the
-first session is established the terminal switches to raw mode and
-Ctrl-C is forwarded to the remote shell like any other keystroke; from
-then on, `~.` is the only way out.
+if you don't want to wait for ssh's own `ConnectTimeout` /
+`ConnectionAttempts` to expire, or to cancel an auth prompt.
+If the first connect fails for any reason, the wrapper does **not** retry —
+it prints ssh's own stderr (`Permission denied (publickey)`, `Could
+not resolve hostname …`, etc.) and exits with status 1. Silent
+retries here would mask real problems like a wrong host, missing
+remote `xssh` binary, or auth failure. Once the first connection is
+established the terminal switches to raw mode and Ctrl-C is
+forwarded to the remote shell like any other keystroke; from then
+on, `~.` is the only way out.
 
 ## Debug mode
 
@@ -764,6 +770,7 @@ the connection without setting up any streams.
 | Code | Meaning |
 |------|---------|
 | `0`  | Remote shell exited cleanly (user typed `exit`, or your command finished). |
+| `1`  | First-connect failure — ssh couldn't establish the initial session (wrong host, auth failure, remote `xssh` binary missing, etc). Client prints `continuous-ssh: initial connection failed` followed by ssh's own stderr. Not retried; re-run after fixing the underlying issue. |
 | `129`| Remote daemon was stopped by signal (signal-induced shutdown, or successful replay of a signal-preserved session). Client prints `continuous-ssh: remote daemon stopped.` |
 | `130`| User aborted with `~.` (prints `Connection aborted.`), **or** replay was refused because the previous daemon didn't shut down cleanly (prints the "not cleanly shut down" message above). |
 | `132`| Protocol-version mismatch between local and remote xssh binaries. Client prints `continuous-ssh: incompatible protocol (local=X.Y, remote=A.B). Re-deploy the matching xssh binary to the remote.` Major-version differences are fatal; same-major minor differences are accepted silently. |
