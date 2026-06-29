@@ -381,7 +381,6 @@ func (c *client) run() int {
 		return nil
 	}
 
-	consecutiveFails := 0
 	for {
 		if ctx.Err() != nil {
 			c.aborted = true
@@ -399,8 +398,7 @@ func (c *client) run() int {
 		// First-connect failures don't retry — there's nothing yet to
 		// reconnect to, and silently re-attempting would mask real
 		// problems (wrong host, ssh auth failure, remote xssh binary
-		// missing). Surface ssh's own diagnostic and exit. Past the
-		// first successful HELLO_ACK the retry budget below kicks in.
+		// missing). Surface ssh's own diagnostic and exit.
 		if first {
 			msg := strings.TrimSpace(result.sshStderr)
 			if msg != "" {
@@ -410,17 +408,11 @@ func (c *client) run() int {
 			}
 			return 1
 		}
-		// Safety net: if the session id is set (we've connected before)
-		// and a sequence of reconnect attempts is failing without ever
-		// producing an EXIT, assume the session is truly gone — the
-		// replay daemon may have cleaned up the session dir already —
-		// and bail with the standard "remote daemon stopped" notice.
-		consecutiveFails++
-		if consecutiveFails >= 5 {
-			dlog.E("giving up after %d failed reconnects to session %s", consecutiveFails, c.sessionID)
-			return 129
-		}
-		dlog.V("reconnect: backing off (consecutiveFails=%d)", consecutiveFails)
+		// Reconnects retry forever with a constant 500 ms backoff. The
+		// remote session may still be sitting there waiting (resumed
+		// laptop, lost wifi, roaming to a new network); we keep trying
+		// until the user aborts with `~.` or a real EXIT frame arrives.
+		dlog.V("reconnect: backing off")
 		select {
 		case <-ctx.Done():
 		case <-time.After(500 * time.Millisecond):

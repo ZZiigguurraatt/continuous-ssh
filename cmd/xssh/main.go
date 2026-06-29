@@ -47,8 +47,8 @@ Usage:
 
 The remote always runs your login shell. ssh-args (flags + target) are
 forwarded verbatim to the system ssh binary. On disconnect the wrapper
-reconnects silently; if the remote session is unrecoverable it gives up
-after a few attempts.
+reconnects silently and retries forever until the remote delivers an
+EXIT frame or you abort with ~.
 
 Flags:
   --debug       verbose logging to a per-invocation file under

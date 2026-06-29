@@ -17,8 +17,10 @@ Only the shell's own stdio is shown — the wrapper is otherwise invisible.
 The motivating use case is *laptop sleep*: you're running a long command
 on a remote machine, you close the lid, and when you wake the laptop the
 session is still there with all the output that was produced while you
-were away. Same idea applies to brief network drops, switching APs, or
-similar transient breaks.
+were away. Same idea applies to network drops, switching APs, or other
+breaks — the gap can be arbitrarily long; the only real limit is the
+host-wide DiskBudget bounding how much unacked output piles up while
+the link is down.
 
 For best results, pair it with a **WireGuard tunnel** between the
 laptop and the remote. The TCP connection that ssh rides on will then
@@ -30,8 +32,10 @@ network changes rather than needing to be re-established by this tool.
 - Single binary, deployed identically on local and remote, that wraps the
   system `ssh` binary as-is — no separate listener, no extra daemon to
   install, no configuration file.
-- Survive transient disconnects (laptop sleep, brief network outage,
-  WiFi handoff) without the user noticing or losing output.
+- Survive disconnects (laptop sleep, network outage, WiFi handoff)
+  without the user noticing or losing output. Gap duration is
+  bounded only by the host-wide DiskBudget, not by any per-event
+  timer.
 - **Remote processes keep running across disconnects.** Whatever you had
   going on the remote shell — a long build, a download, a TUI program —
   continues to run while the local link is down. The wrapper reconnects
@@ -292,8 +296,8 @@ Usage:
 
 The remote always runs your login shell. ssh-args (flags + target) are
 forwarded verbatim to the system ssh binary. On disconnect the wrapper
-reconnects silently; if the remote session is unrecoverable it gives up
-after a few attempts.
+reconnects silently and retries forever until the remote delivers an
+EXIT frame or you abort with `~.`.
 
 Flags:
   --debug       verbose logging to a per-invocation file under
@@ -406,9 +410,21 @@ the session ends, so they don't accumulate).
   line) to tune how quickly a dead link is noticed.
 - On a detected disconnect the wrapper retries silently — no banner, no
   log line — with a 500 ms backoff between attempts.
-- **Bounded retries:** if a session was established and then five
-  consecutive reconnect attempts fail without producing an EXIT frame,
-  the client gives up and prints `continuous-ssh: remote daemon stopped.`
+- **Reconnects retry forever.** Once a session has been established,
+  the wrapper keeps trying to reconnect until the user aborts with
+  `~.` or the remote delivers an EXIT frame (clean shell exit, replay
+  done, disk-cap shutdown, etc.). This lets a session survive
+  arbitrarily long network gaps — laptop suspended overnight, roaming
+  between networks, waiting to join wifi at a new location. When the
+  link finally comes back, the usual outcome is that the daemon is
+  still running and the session resumes transparently. If instead the
+  daemon is gone but a `clean` marker is on disk (host rebooted
+  between sleep and resume, etc.), the replay daemon spawned by
+  `attach` serves the preserved buffer and delivers EXIT(129) (or
+  EXIT(134) for a disk-cap shutdown) which terminates the loop. One
+  caveat: if the session directory is removed externally (`xssh rm`)
+  while the client is mid-retry, the client will loop forever —
+  there's no daemon left to send an EXIT frame. Abort with `~.`.
 - Window-size changes (`SIGWINCH`) propagate to the remote PTY via a
   `RESIZE` frame; the initial size is sent right after `HELLO_ACK`.
 
@@ -567,7 +583,6 @@ visible in one place.
 | `DefaultChunkSize` | **1 MiB** | `internal/buffer/buffer.go` | Granularity of SHA-256 chunk hashes and the "always resend last complete chunk" rule for ragged-edge reconnects. |
 | `ackInterval` | **5 MiB** | `internal/client/client.go` | Size trigger — client emits an ACK after this many newly-displayed bytes since the last ACK. |
 | `ackIdleMax` | **1 s** | `internal/client/client.go` | Time trigger — client emits an ACK after this long with any unacked bytes pending. Keeps low-rate streams from accumulating on the daemon. |
-| `consecutiveFails` cap | **5** | `internal/client/client.go` | After this many back-to-back reconnect failures (post first connect), client gives up with exit 129. |
 | reconnect backoff | **500 ms** | `internal/client/client.go` | Wait between reconnect attempts. |
 | `keepAliveGrace` | **30 s** | `internal/daemon/daemon.go` | After client disconnect, daemon keeps its listener open this long before closing it (so a quick reconnect doesn't lose the socket). |
 | SHUTDOWN drain | **2 s** | `internal/client/client.go` | After `~.`, client waits this long for ssh to deliver the SHUTDOWN frame before killing it. |
@@ -620,6 +635,12 @@ replay daemon refuses to serve and the client prints:
 ```
 continuous-ssh: session was not cleanly shut down; recovery aborted.
 ```
+
+A missing `clean` marker on a session whose daemon is gone usually
+means the remote took an **unexpected power outage** (or some other
+abrupt kill — kernel OOM, the VM being yanked, etc.) — the daemon
+catches all the normal termination signals and writes the marker on
+its way out, so its absence implies the daemon never got the chance.
 
 The on-disk buffer is *left in place* in that case so you can grab it
 by hand (e.g. `scp -r host:~/.continuous-ssh/sessions/<id> .` —
@@ -828,11 +849,6 @@ Notes on the recipe:
   large enough to be a meaningful reconcile test. Without it,
   `pkill` triggers an immediate reconnect with only a few hundred
   bytes of lag.
-- Don't wait too long with the network down: each failed reconnect
-  attempt counts toward the 5-strikes-and-out budget, after which
-  the client exits with code 129 (`remote daemon stopped`). Each
-  attempt takes ~21 s of TCP-SYN timeout, so you have ~100 s of
-  budget before that fires.
 
 **Test B — disk-cap shutdown + replay (destroys the session)**
 
