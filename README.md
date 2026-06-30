@@ -317,10 +317,15 @@ Flags:
                 invocation exited with code 137 (auth, host key, etc.):
                 the remote daemon is still running, so this flag lets
                 you reattach after fixing the underlying problem.
-                Known limitation: reattaching into a session whose
-                foreground program is in alt-screen mode (vim, htop)
-                renders into the local main screen until the program
-                quits and is restarted.
+                Alt-screen continuity is preserved across reattach:
+                if the foreground program (vim, htop, …) is in
+                alt-screen mode, the local terminal enters alt-screen
+                and a Ctrl-L is sent so the program redraws cleanly
+                (Ctrl-L is byte 0x0C, the conventional "redraw the
+                screen" keystroke that vim/htop/less and most TUI
+                programs interpret as a repaint request — once the
+                local terminal is in alt-screen, the redrawn content
+                lands in the right buffer).
 
 Key sequences (at start of line):
   ~.   abort and exit
@@ -775,8 +780,10 @@ The one-step shortcut for the same effect is `xssh rm --kill --active`.
 
 The wire protocol carried inside the SSH transport has an explicit
 `major.minor` version exchanged in HELLO/HELLO_ACK at session start.
-Initial version is **`1.0`** (see `ProtocolMajor`/`ProtocolMinor` in
-`internal/proto/frame.go`).
+Current version is **`1.1`** (see `ProtocolMajor`/`ProtocolMinor` in
+`internal/proto/frame.go`). 1.0 → 1.1 added a trailing alt-screen
+state byte to HELLO_ACK; 1.0 peers omit the byte and decoders
+default it to false.
 
 Compatibility rule:
 

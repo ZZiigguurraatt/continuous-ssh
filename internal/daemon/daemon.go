@@ -29,6 +29,7 @@ import (
 
 	"github.com/creack/pty"
 
+	"github.com/zziigguurraatt/continuous-ssh/internal/altscreen"
 	"github.com/zziigguurraatt/continuous-ssh/internal/buffer"
 	"github.com/zziigguurraatt/continuous-ssh/internal/chunk"
 	"github.com/zziigguurraatt/continuous-ssh/internal/dlog"
@@ -359,6 +360,15 @@ type daemon struct {
 	outputBuf *buffer.Buffer
 	ptmx      *os.File
 
+	// altScanner watches PTY output for alt-screen-buffer enter/exit
+	// escape sequences and keeps `inAltScreen` current. Reported on
+	// HELLO_ACK so a reattaching client can resync its local
+	// terminal before output streams in. Read by serveAttach (one
+	// goroutine), written by pumpPTY (a different goroutine) —
+	// hence atomic.Bool for the published flag.
+	altScanner  altscreen.Scanner
+	inAltScreen atomic.Bool
+
 	// stdinCh hands Stdin payloads from readUpstream to the
 	// per-daemon ptmx-writer goroutine. Buffered so readUpstream can
 	// drop frames non-blockingly when the PTY input buffer is full
@@ -615,6 +625,9 @@ func (d *daemon) pumpPTY() {
 				d.wake()
 				return
 			}
+			if ev := d.altScanner.Scan(p[:n]); ev != 0 {
+				d.inAltScreen.Store(ev == 'h')
+			}
 			d.wake()
 		}
 		if err != nil {
@@ -759,6 +772,7 @@ func (d *daemon) serveAttach(conn net.Conn) {
 		Mode:      chunk.ModeAttach,
 		SessionID: d.sessionID,
 		Output:    outputMan,
+		AltScreen: d.inAltScreen.Load(),
 	}).Encode()
 	if err != nil {
 		dlog.E("ack encode: %v", err)

@@ -23,6 +23,7 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/zziigguurraatt/continuous-ssh/internal/altscreen"
 	"github.com/zziigguurraatt/continuous-ssh/internal/buffer"
 	"github.com/zziigguurraatt/continuous-ssh/internal/chunk"
 	"github.com/zziigguurraatt/continuous-ssh/internal/dlog"
@@ -368,7 +369,7 @@ type client struct {
 	// \e[?1049l (which restores the cursor from the running program's
 	// fresh save); otherwise we emit \e[?1047l (no cursor restore, avoids
 	// any stale save from a long-exited earlier program).
-	altScanner  altScanner
+	altScanner  altscreen.Scanner
 	inAltScreen atomic.Bool
 
 	aborted bool
@@ -713,7 +714,24 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		c.sessionID = ackHello.SessionID
 		dlog.V("session id assigned: %s", c.sessionID)
 	}
-	dlog.V("HELLO_ACK daemonTotal=%d", ackHello.Output.Total)
+	dlog.V("HELLO_ACK daemonTotal=%d altScreen=%v", ackHello.Output.Total, ackHello.AltScreen)
+
+	// Reattach-into-alt-screen continuity. The daemon advertises
+	// whether its current foreground program is in the alt-screen
+	// buffer. If yes AND our local terminal isn't already there
+	// (i.e. this is a fresh xssh invocation, not an in-loop retry —
+	// retries keep alt-screen on the local end across the gap), we
+	// need to enter alt-screen on the local terminal before the
+	// daemon's output stream starts arriving, and queue a Ctrl-L
+	// to make the remote program redraw cleanly into the now-correct
+	// buffer. Without this, `xssh --session <id>` into a session
+	// whose vim was open would scribble into the user's main screen.
+	needRedrawKick := false
+	if ackHello.AltScreen && !c.inAltScreen.Load() {
+		fmt.Fprint(c.termOut, "\x1b[?1049h")
+		c.inAltScreen.Store(true)
+		needRedrawKick = true
+	}
 
 	// New session — reset the ACK watermark so the first ACK fires after
 	// 5 MiB of NEW data, not based on whatever the previous session
@@ -729,6 +747,17 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		c.killSSH(sshCmd)
 		stderrWG.Wait()
 		return runResult{sshStderr: stderrBuf.String(), helloAcked: helloAcked}
+	}
+
+	// Trigger the remote program's redraw. Ctrl-L (0x0c) goes
+	// straight to pc as a Stdin frame — the remote PTY delivers
+	// it to vim/htop/less which respond with a fresh repaint into
+	// the alt-screen we just entered. Goes via pc directly rather
+	// than through stdinCh because stdinCh is receive-only here.
+	if needRedrawKick {
+		if werr := pc.WriteFrame(proto.Frame{Type: proto.Stdin, Payload: []byte{0x0c}}); werr != nil {
+			dlog.V("alt-screen Ctrl-L kick: %v", werr)
+		}
 	}
 
 	// This session is now active. Hand it to SIGWINCH and send the initial
@@ -1107,68 +1136,6 @@ func sendTerminalReset(w io.Writer, inAltScreen bool) {
 			"\x1b[?1l"+
 			"\x1b[?7h"+
 			"\x1b[m")
-}
-
-// altScanner tracks alt-screen buffer enter/exit sequences in an
-// arbitrary byte stream. State persists across Scan calls so that a
-// sequence split across two writes is still recognised correctly.
-//
-// Recognised sequences (all DEC private modes — note the leading "?"):
-//
-//	\e[?47h   /  \e[?47l
-//	\e[?1047h /  \e[?1047l
-//	\e[?1049h /  \e[?1049l   (the modern, ncurses-default form)
-//
-// Multi-parameter forms like "\e[?25;1049h" are also handled.
-type altScanner struct {
-	state int    // 0 idle, 1 saw ESC, 2 saw [, 3 saw ?, accumulating digits
-	parm  []byte // accumulated digits + ';' separators in state 3
-}
-
-// Scan feeds bytes through the state machine. The returned event byte is
-// 'h' (entered alt-screen) or 'l' (exited alt-screen) for the *last* such
-// transition observed in p, or 0 if none were observed.
-func (a *altScanner) Scan(p []byte) byte {
-	var ev byte
-	for _, b := range p {
-		switch a.state {
-		case 0:
-			if b == 0x1B {
-				a.state = 1
-			}
-		case 1:
-			if b == '[' {
-				a.state = 2
-			} else {
-				a.state = 0
-			}
-		case 2:
-			if b == '?' {
-				a.state = 3
-				a.parm = a.parm[:0]
-			} else {
-				a.state = 0
-			}
-		case 3:
-			switch {
-			case (b >= '0' && b <= '9') || b == ';':
-				if len(a.parm) < 32 {
-					a.parm = append(a.parm, b)
-				}
-			case b == 'h' || b == 'l':
-				for _, p := range strings.Split(string(a.parm), ";") {
-					if p == "47" || p == "1047" || p == "1049" {
-						ev = b
-						break
-					}
-				}
-				a.state = 0
-			default:
-				a.state = 0
-			}
-		}
-	}
-	return ev
 }
 
 // crlfTranslator wraps an io.Writer and translates each bare '\n' (one not

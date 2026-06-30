@@ -69,7 +69,7 @@ const (
 //     existing frames.
 const (
 	ProtocolMajor uint8 = 1
-	ProtocolMinor uint8 = 0
+	ProtocolMinor uint8 = 1
 )
 
 type Frame struct {

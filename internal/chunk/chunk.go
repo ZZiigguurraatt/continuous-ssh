@@ -42,12 +42,23 @@ type Manifest struct {
 // peers. DecodeHello populates them as-received; the caller is
 // responsible for checking against proto.ProtocolMajor/Minor and
 // deciding whether to proceed.
+//
+// AltScreen is meaningful on HELLO_ACK only (and only on protocol
+// 1.1+): when set, the daemon's remote PTY is currently in the
+// alt-screen buffer (vim, htop, less). A reattaching client uses
+// this to enter alt-screen on the local terminal before output
+// streams in and to send a Ctrl-L so the remote program redraws —
+// cleanly handling a `--session` reattach into a TUI without
+// scribbling onto the main screen. Older daemons (1.0) leave the
+// trailing byte off the wire and the client decodes false, falling
+// back to the pre-feature behavior.
 type Hello struct {
 	Major     uint8
 	Minor     uint8
 	Mode      Mode
 	SessionID string
 	Output    Manifest
+	AltScreen bool
 }
 
 func (h *Hello) Encode() ([]byte, error) {
@@ -74,6 +85,15 @@ func (h *Hello) Encode() ([]byte, error) {
 	payload = append(payload, hdr[:]...)
 	for _, hash := range h.Output.Hashes {
 		payload = append(payload, hash[:]...)
+	}
+	// AltScreen trails the manifest as a single byte. Older
+	// decoders that don't know about this field simply stop after
+	// reading the manifest and ignore the trailing byte, so this
+	// is a backward-compatible minor-version addition.
+	if h.AltScreen {
+		payload = append(payload, 1)
+	} else {
+		payload = append(payload, 0)
 	}
 	return payload, nil
 }
@@ -116,6 +136,11 @@ func DecodeHello(p []byte) (*Hello, error) {
 		p = p[hashSize:]
 	}
 	h.Output = m
+	// AltScreen — optional trailing byte added in protocol 1.1.
+	// Older peers don't send it; we default to false in that case.
+	if len(p) >= 1 {
+		h.AltScreen = p[0] != 0
+	}
 	return h, nil
 }
 
