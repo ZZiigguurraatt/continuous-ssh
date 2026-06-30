@@ -355,6 +355,38 @@ The remote shell runs attached to a PTY, so interactive programs
 stdout and stderr from the remote are merged into a single stream by
 the PTY itself — same as `ssh user@host` and unlike `ssh -T user@host`.
 
+## Auto-install on missing remote binary
+
+When the connection fails because the remote shell can't find `xssh`
+on `PATH` (`bash: xssh: command not found` and similar), the client
+detects the pattern and offers to push a copy of the local binary
+over.
+
+The remote is probed once for `id -u`, `uname -s`/`uname -m`,
+`$HOME`, and its preferred Go bindir (using the same
+`GOBIN`/`GOPATH/bin`/`$HOME/go/bin` cascade as the `Makefile`'s
+`do_deploy` recipe).
+
+The default install path follows the same convention as
+`make deploy`:
+
+- `root` on the remote → `/usr/local/bin/xssh`
+- non-root → the remote's `go env GOBIN` (else `GOPATH/bin`, else
+  `$HOME/go/bin`)
+
+The prompt accepts:
+
+- `Y` / `yes` / empty → install at the default path
+- `n` / `no` → cancel and exit
+- any path → install at that path instead (e.g. `/opt/bin/xssh`)
+
+Architecture is verified before any bytes are pushed — if the local
+binary is `linux/amd64` but the remote reports `linux/arm64`, the
+push is refused and the user is referred to manually using the
+`make pi64`/`pi32`/`pi-zero` cross-compile targets.
+
+On successful push the original connection is retried automatically.
+
 ## Key sequences
 
 At the **start of a line** (immediately after a newline, or as the first

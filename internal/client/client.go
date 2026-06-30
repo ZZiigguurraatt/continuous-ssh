@@ -15,6 +15,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -435,10 +437,22 @@ func (c *client) run() int {
 		// missing). Surface ssh's own diagnostic and exit.
 		if first {
 			msg := strings.TrimSpace(result.sshStderr)
+			// Remote `xssh` missing on PATH: offer to push the
+			// local binary up before bailing. On success we loop
+			// back to retry the original connection; on user
+			// declination, the push failing, etc., we fall through
+			// to the standard bail-with-message path.
+			if isRemoteXsshMissing(msg) && c.offerAutoInstall(msg) {
+				continue
+			}
+			headline := "continuous-ssh: initial connection failed"
+			if isRemoteXsshMissing(msg) {
+				headline = "continuous-ssh: remote `xssh` not found on PATH — install/deploy the binary on the remote first"
+			}
 			if msg != "" {
-				fmt.Fprintf(os.Stderr, "continuous-ssh: initial connection failed\n%s\n", msg)
+				fmt.Fprintf(os.Stderr, "%s\n%s\n", headline, msg)
 			} else {
-				fmt.Fprintln(os.Stderr, "continuous-ssh: initial connection failed")
+				fmt.Fprintln(os.Stderr, headline)
 			}
 			return 1
 		}
@@ -454,10 +468,24 @@ func (c *client) run() int {
 		// ssh's own stderr to decide.
 		if !result.helloAcked && !isTransientConnectError(result.sshStderr) {
 			msg := strings.TrimSpace(result.sshStderr)
+			// Remote `xssh` missing on reconnect: offer to push
+			// the local binary up. Same path as the first-connect
+			// branch, but we have to dance the local terminal out
+			// of raw mode for the prompt and back into raw mode
+			// if we proceed to retry.
+			if isRemoteXsshMissing(msg) {
+				if c.offerAutoInstallRaw(msg) {
+					continue
+				}
+			}
+			headline := "continuous-ssh: reconnect failed"
+			if isRemoteXsshMissing(msg) {
+				headline = "continuous-ssh: remote `xssh` is missing from PATH — redeploy the binary that existed before the disconnect"
+			}
 			if msg != "" {
-				fmt.Fprintf(os.Stderr, "continuous-ssh: reconnect failed\n%s\n", msg)
+				fmt.Fprintf(os.Stderr, "%s\n%s\n", headline, msg)
 			} else {
-				fmt.Fprintln(os.Stderr, "continuous-ssh: reconnect failed")
+				fmt.Fprintln(os.Stderr, headline)
 			}
 			// Tell the user how to reattach after fixing the
 			// underlying problem — the remote daemon is still
@@ -963,6 +991,25 @@ func isTransientConnectError(stderr string) bool {
 		strings.Contains(s, "ssh: Could not resolve hostname")
 }
 
+// isRemoteXsshMissing returns true when ssh's stderr looks like
+// the remote shell couldn't find the `xssh` binary on PATH — the
+// deployment-problem case. Conservative match: requires both the
+// binary name and a shell-specific "not found" phrase to appear in
+// the same captured stderr. Covers the common shells:
+//
+//	bash:  "bash: xssh: command not found"
+//	zsh:   "zsh: command not found: xssh"
+//	dash:  "/bin/sh: 1: xssh: not found"
+//	fish:  "fish: Unknown command: xssh"
+func isRemoteXsshMissing(stderr string) bool {
+	if !strings.Contains(stderr, "xssh") {
+		return false
+	}
+	return strings.Contains(stderr, "command not found") ||
+		strings.Contains(stderr, ": not found") ||
+		strings.Contains(stderr, "Unknown command")
+}
+
 func (c *client) readFrames(pc *proto.Conn, exitCh chan<- int) {
 	for {
 		f, err := pc.ReadFrame()
@@ -1169,4 +1216,294 @@ func (c *crlfTranslator) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// remoteEnv is the structured result of the one-shot ssh probe we
+// run when offering to auto-install the binary. Fields:
+//
+//	uid       remote effective UID (0 → root → install to /usr/local/bin/)
+//	goos      mapped from `uname -s` (linux, darwin, …)
+//	goarch    mapped from `uname -m` (amd64, arm64, arm, 386, …)
+//	homeDir   remote `$HOME`, for display only
+//	userBin   the directory `go install` would drop binaries into on
+//	          the remote, mirroring the Makefile's `do_deploy` probe:
+//	          GOBIN if set, else GOPATH/bin, else $HOME/go/bin.
+type remoteEnv struct {
+	uid     int
+	goos    string
+	goarch  string
+	homeDir string
+	userBin string
+}
+
+// queryRemoteEnv runs a single ssh command on the remote that emits
+// five newline-separated fields. Reuses the user's ssh args so any
+// `-i key`, `-p port`, `-o ...` flags carry over.
+func (c *client) queryRemoteEnv() (*remoteEnv, error) {
+	const probe = `id -u
+uname -s
+uname -m
+printf '%s\n' "$HOME"
+if command -v go >/dev/null 2>&1; then
+  gobin=$(go env GOBIN)
+  if [ -n "$gobin" ]; then printf '%s\n' "$gobin"
+  else printf '%s\n' "$(go env GOPATH)/bin"; fi
+else
+  printf '%s\n' "$HOME/go/bin"
+fi
+`
+	args := []string{"-T"}
+	args = append(args, c.sshArgs...)
+	args = append(args, probe)
+	cmd := exec.Command("ssh", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ssh probe: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 5 {
+		return nil, fmt.Errorf("ssh probe: expected 5 lines, got %d", len(lines))
+	}
+	uid, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil {
+		return nil, fmt.Errorf("ssh probe: bad uid %q: %w", lines[0], err)
+	}
+	return &remoteEnv{
+		uid:     uid,
+		goos:    unameToGOOS(strings.TrimSpace(lines[1])),
+		goarch:  unameToGOARCH(strings.TrimSpace(lines[2])),
+		homeDir: strings.TrimSpace(lines[3]),
+		userBin: strings.TrimSpace(lines[4]),
+	}, nil
+}
+
+// unameToGOOS / unameToGOARCH translate `uname` output into Go's GOOS
+// and GOARCH naming. Unrecognized values pass through unchanged so the
+// arch-mismatch check below can still report what we saw.
+func unameToGOOS(s string) string {
+	switch s {
+	case "Linux":
+		return "linux"
+	case "Darwin":
+		return "darwin"
+	case "FreeBSD":
+		return "freebsd"
+	case "OpenBSD":
+		return "openbsd"
+	case "NetBSD":
+		return "netbsd"
+	}
+	return s
+}
+
+func unameToGOARCH(s string) string {
+	switch s {
+	case "x86_64", "amd64":
+		return "amd64"
+	case "aarch64", "arm64":
+		return "arm64"
+	case "armv7l", "armv6l", "armhf", "arm":
+		return "arm"
+	case "i386", "i486", "i586", "i686":
+		return "386"
+	}
+	return s
+}
+
+// offerAutoInstall is the cooked-mode entry point — used from the
+// first-connect bail path, where the terminal hasn't been switched
+// into raw mode yet so reading user input via bufio works fine.
+// Returns true iff the binary was successfully pushed and the caller
+// should retry the connection.
+func (c *client) offerAutoInstall(sshStderr string) bool {
+	return c.runAutoInstall(sshStderr)
+}
+
+// offerAutoInstallRaw is the raw-mode entry point — used from the
+// reconnect bail path, where the terminal is in raw mode. We
+// temporarily restore cooked mode for the prompt, then re-enter raw
+// mode if the install succeeded and we're about to retry. (If the
+// install was declined or failed, the caller will print the error
+// and exit — restoring is moot but harmless.)
+func (c *client) offerAutoInstallRaw(sshStderr string) bool {
+	if c.oldState == nil {
+		// Should not happen — reconnect path implies activate() ran.
+		return c.runAutoInstall(sshStderr)
+	}
+	cooked, err := term.GetState(c.stdinFd)
+	if err != nil {
+		return false
+	}
+	_ = term.Restore(c.stdinFd, c.oldState)
+	defer func() {
+		if cooked != nil {
+			_ = term.Restore(c.stdinFd, cooked)
+		}
+	}()
+	return c.runAutoInstall(sshStderr)
+}
+
+// runAutoInstall implements the shared flow: print headline + ssh
+// stderr, probe the remote, validate arch, prompt for path, push
+// the local binary. Caller is responsible for terminal mode.
+func (c *client) runAutoInstall(sshStderr string) bool {
+	self, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auto-install: locate local binary: %v\n", err)
+		return false
+	}
+	fi, err := os.Stat(self)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auto-install: stat local binary: %v\n", err)
+		return false
+	}
+
+	fmt.Fprintln(os.Stderr, "continuous-ssh: remote `xssh` not found on PATH")
+	if msg := strings.TrimSpace(sshStderr); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
+	}
+	fmt.Fprintln(os.Stderr)
+
+	env, err := c.queryRemoteEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auto-install: ssh probe failed: %v\n", err)
+		return false
+	}
+
+	if env.goos != runtime.GOOS || env.goarch != runtime.GOARCH {
+		fmt.Fprintf(os.Stderr,
+			"auto-install: arch mismatch — local binary is %s/%s, remote is %s/%s.\nRebuild for the remote architecture (see `make pi64`/`pi32`/`pi-zero`) and run `make deploy HOST=...`.\n",
+			runtime.GOOS, runtime.GOARCH, env.goos, env.goarch)
+		return false
+	}
+
+	var defaultPath string
+	if env.uid == 0 {
+		defaultPath = "/usr/local/bin/xssh"
+	} else {
+		defaultPath = strings.TrimRight(env.userBin, "/") + "/xssh"
+	}
+
+	target := extractSSHTarget(c.sshArgs)
+	fmt.Fprintf(os.Stderr,
+		"Push local %s (%s, %s/%s) to %s:%s?\n",
+		self, humanBytesShort(fi.Size()), runtime.GOOS, runtime.GOARCH,
+		target, defaultPath)
+	fmt.Fprintln(os.Stderr, "  [Y]es        install at the default location above")
+	fmt.Fprintln(os.Stderr, "  [n]o         cancel")
+	fmt.Fprintln(os.Stderr, "  any path     install at that path instead (e.g. /opt/bin/xssh)")
+	fmt.Fprint(os.Stderr, ": ")
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return false
+	}
+	line = strings.TrimSpace(line)
+
+	var destPath string
+	switch strings.ToLower(line) {
+	case "", "y", "yes":
+		destPath = defaultPath
+	case "n", "no":
+		fmt.Fprintln(os.Stderr, "Cancelled.")
+		return false
+	default:
+		if !isSafeRemotePath(line) {
+			fmt.Fprintln(os.Stderr, "Path contains unsafe characters; cancelled.")
+			return false
+		}
+		destPath = line
+	}
+
+	fmt.Fprintf(os.Stderr, "Pushing to %s:%s … ", target, destPath)
+	if err := c.pushBinary(self, destPath); err != nil {
+		fmt.Fprintf(os.Stderr, "failed: %v\n", err)
+		return false
+	}
+	fmt.Fprintln(os.Stderr, "done. Retrying.")
+	return true
+}
+
+// isSafeRemotePath conservatively accepts paths made of alphanumerics
+// and `/ . _ - ~ $`. The `~` is left intact so the remote shell
+// expands it; the `$` is left intact so `$HOME/...` expressions work.
+// Anything else (shell metacharacters, quotes, backticks) is rejected
+// so a user-supplied custom path can't smuggle a command into the
+// remote shell invocation.
+func isSafeRemotePath(p string) bool {
+	if p == "" {
+		return false
+	}
+	for _, r := range p {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9':
+		case r == '/', r == '.', r == '_', r == '-', r == '~', r == '$':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// pushBinary scp-equivalents the local binary onto the remote via
+// ssh stdin: `cat <local | ssh <args> 'mkdir -p $(dirname …) && cat > …tmp && chmod +x …tmp && mv …tmp …'`.
+// The .tmp + atomic mv keeps any existing binary intact on partial
+// transfer.
+func (c *client) pushBinary(localBinary, destPath string) error {
+	f, err := os.Open(localBinary)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// destPath is either one of our defaults (safe by construction)
+	// or a user input that passed isSafeRemotePath, so unquoted
+	// substitution into the shell command is safe and lets the
+	// remote shell expand ~ and $HOME.
+	remoteScript := fmt.Sprintf(
+		"mkdir -p $(dirname %s) && cat > %s.tmp && chmod +x %s.tmp && mv %s.tmp %s",
+		destPath, destPath, destPath, destPath, destPath,
+	)
+	args := []string{"-T"}
+	args = append(args, c.sshArgs...)
+	args = append(args, remoteScript)
+	cmd := exec.Command("ssh", args...)
+	cmd.Stdin = f
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// extractSSHTarget pulls the user@host (or host, or alias) out of
+// the ssh args list, for display in the install prompt. Picks the
+// last non-flag, non-flag-value token — same heuristic as the
+// per-invocation log filename builder.
+func extractSSHTarget(sshArgs []string) string {
+	for i := len(sshArgs) - 1; i >= 0; i-- {
+		t := sshArgs[i]
+		if strings.HasPrefix(t, "-") {
+			break
+		}
+		return t
+	}
+	return "remote"
+}
+
+// humanBytesShort formats a byte count concisely (e.g. "8.7 MB").
+// Inline here to avoid pulling in the sessions package just for this.
+func humanBytesShort(n int64) string {
+	const k = 1024
+	switch {
+	case n < k:
+		return fmt.Sprintf("%d B", n)
+	case n < k*k:
+		return fmt.Sprintf("%.1f KB", float64(n)/k)
+	case n < k*k*k:
+		return fmt.Sprintf("%.1f MB", float64(n)/(k*k))
+	default:
+		return fmt.Sprintf("%.1f GB", float64(n)/(k*k*k))
+	}
 }
