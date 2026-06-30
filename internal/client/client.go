@@ -171,6 +171,8 @@ func Run(argv []string) int {
 			msg = "continuous-ssh: remote daemon stopped because the host-wide disk cap was exceeded (long disconnect with fast output). Run `xssh rm` on the remote to free space."
 		case 135:
 			msg = "continuous-ssh: cannot start new session — the host-wide disk cap is reached. Connect with plain ssh and run `xssh rm` to free space."
+		case 136:
+			msg = "continuous-ssh: remote session no longer exists; nothing to reconnect to."
 		}
 		if msg != "" {
 			// Emit a bare CR (no LF) before the message: returns the

@@ -421,10 +421,13 @@ the session ends, so they don't accumulate).
   daemon is gone but a `clean` marker is on disk (host rebooted
   between sleep and resume, etc.), the replay daemon spawned by
   `attach` serves the preserved buffer and delivers EXIT(133) (or
-  EXIT(134) for a disk-cap shutdown) which terminates the loop. One
-  caveat: if the session directory is removed externally (`xssh rm`)
-  while the client is mid-retry, the client will loop forever —
-  there's no daemon left to send an EXIT frame. Abort with `~.`.
+  EXIT(134) for a disk-cap shutdown) which terminates the loop. If
+  segments are on disk but the `clean` marker is missing (hard kill
+  / power outage path), the replay daemon refuses with EXIT(130).
+  If nothing is left to recover at all (someone ran `xssh rm` while
+  the client was retrying), `attach` sends EXIT(136) on the next
+  reconnect so the client prints a clear "session no longer exists"
+  message and exits without looping.
 - Window-size changes (`SIGWINCH`) propagate to the remote PTY via a
   `RESIZE` frame; the initial size is sent right after `HELLO_ACK`.
 
@@ -799,6 +802,7 @@ the connection without setting up any streams.
 | `132`| Protocol-version mismatch between local and remote xssh binaries. Client prints `continuous-ssh: incompatible protocol (local=X.Y, remote=A.B). Re-deploy the matching xssh binary to the remote.` Major-version differences are fatal; same-major minor differences are accepted silently. |
 | `134`| Remote daemon shut itself down because the host-wide disk cap was exceeded and this session was above its fair share (typically a long disconnect with fast output). Buffer was preserved and replayed successfully. Client prints `continuous-ssh: remote daemon stopped because the host-wide disk cap was exceeded (long disconnect with fast output).` |
 | `135`| New session refused before it could start: the host-wide disk cap is already at or above DiskBudget. Client prints `continuous-ssh: cannot start new session — the host-wide disk cap is reached.` |
+| `136`| Reconnect refused: the remote session no longer exists (no daemon socket, no segments to replay — typically `xssh rm` ran while the client was retrying). Client prints `continuous-ssh: remote session no longer exists; nothing to reconnect to.` Stops the retry-forever loop. |
 | other| Underlying ssh / command exit code, passed through. |
 
 ## Smoke tests

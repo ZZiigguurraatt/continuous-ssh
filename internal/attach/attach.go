@@ -112,8 +112,14 @@ func Run(argv []string) int {
 				return 1
 			}
 		} else {
-			dlog.E("dial: %v", err)
-			return 1
+			// No daemon socket and no segments to replay — the
+			// session is truly gone. Signal the client with an
+			// EXIT(136) frame so it stops the retry-forever loop
+			// and surfaces a clear message instead of pinging
+			// dead air.
+			dlog.E("dial: %v (no replay segments)", err)
+			writeExitFrame(136)
+			return 136
 		}
 	}
 	defer conn.Close()
@@ -252,11 +258,20 @@ func refuseIfDiskCapHit() bool {
 	if usage < cap {
 		return false
 	}
+	writeExitFrame(135)
+	return true
+}
+
+// writeExitFrame writes a single EXIT frame carrying `code` to
+// ssh's stdout. Used to refuse a connection before any HELLO_ACK
+// is ever sent — the client reads the frame in place of HELLO_ACK,
+// treats it as fatal, and exits with the carried code without
+// triggering the reconnect loop.
+func writeExitFrame(code int) {
 	var p [4]byte
-	binary.BigEndian.PutUint32(p[:], 135)
+	binary.BigEndian.PutUint32(p[:], uint32(code))
 	pc := proto.NewConn(nil, os.Stdout)
 	_ = pc.WriteFrame(proto.Frame{Type: proto.Exit, Payload: p[:]})
-	return true
 }
 
 func bridge(conn net.Conn) int {
