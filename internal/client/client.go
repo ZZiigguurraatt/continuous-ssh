@@ -34,7 +34,7 @@ import (
 // flags is forwarded to `ssh` as arguments. The remote always runs the
 // user's login shell.
 func Run(argv []string) int {
-	sshArgs, logLevel, mirrorStderr, err := parseArgs(argv)
+	sshArgs, sessionID, logLevel, mirrorStderr, err := parseArgs(argv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "continuous-ssh: %v\n", err)
 		return 2
@@ -90,6 +90,7 @@ func Run(argv []string) int {
 		sshArgs:   sshArgs,
 		debug:     debug,
 		logLevel:  logLevel,
+		sessionID: sessionID, // empty unless --session was supplied
 		outputBuf: outputBuf,
 		stdinFd:   stdinFd,
 		termOut:   &crlfTranslator{w: os.Stdout},
@@ -223,10 +224,20 @@ func Run(argv []string) int {
 //               (OUT/IN frames, every ACK sent). High volume. Always
 //               file-only; trace would flood the terminal.
 //
+// --session ID  reconnect to an existing session by id instead of
+//               starting a new one. Useful after a previous xssh
+//               invocation bailed out with exit 137 (e.g. a host-key
+//               mismatch while traveling through a rogue network):
+//               the remote daemon is still running, and this flag
+//               lets you reattach to it after fixing the underlying
+//               issue. The session id is printed in the exit-137
+//               message and also visible in `xssh ls` on the remote.
+//
 // Every other argv element is forwarded to `ssh` verbatim.
-func parseArgs(argv []string) (sshArgs []string, logLevel int, mirrorStderr bool, err error) {
+func parseArgs(argv []string) (sshArgs []string, sessionID string, logLevel int, mirrorStderr bool, err error) {
 	logLevel = dlog.LevelError
-	for _, t := range argv {
+	for i := 0; i < len(argv); i++ {
+		t := argv[i]
 		switch t {
 		case "--debug":
 			logLevel = dlog.LevelVerbose
@@ -235,14 +246,20 @@ func parseArgs(argv []string) (sshArgs []string, logLevel int, mirrorStderr bool
 			logLevel = dlog.LevelVerbose
 		case "--trace-file":
 			logLevel = dlog.LevelTrace
+		case "--session":
+			if i+1 >= len(argv) {
+				return nil, "", 0, false, errors.New("--session requires an argument")
+			}
+			sessionID = argv[i+1]
+			i++
 		default:
 			sshArgs = append(sshArgs, t)
 		}
 	}
 	if len(sshArgs) == 0 {
-		return nil, 0, false, errors.New("ssh target required")
+		return nil, "", 0, false, errors.New("ssh target required")
 	}
-	return sshArgs, logLevel, mirrorStderr, nil
+	return sshArgs, sessionID, logLevel, mirrorStderr, nil
 }
 
 // clientLogPath builds a per-invocation log path under
@@ -385,13 +402,25 @@ func (c *client) run() int {
 		return nil
 	}
 
+	// haveHelloAcked tracks whether any attempt in this invocation has
+	// received a HELLO_ACK yet. Was previously inferred from
+	// `c.sessionID == ""`, but that's no longer accurate now that
+	// --session can pre-populate sessionID before any attempt runs.
+	haveHelloAcked := false
 	for {
 		if ctx.Err() != nil {
 			c.aborted = true
 			return 130
 		}
-		first := c.sessionID == ""
-		result := c.runOnce(ctx, first, stdinCh, activate)
+		first := !haveHelloAcked
+		// runOnce uses "this attempt is a fresh-new-session creation"
+		// to decide between --new and --session for the remote attach;
+		// that's distinct from "is this the first attempt of the
+		// invocation". Pass the fresh-session bit explicitly.
+		result := c.runOnce(ctx, c.sessionID == "", stdinCh, activate)
+		if result.helloAcked {
+			haveHelloAcked = true
+		}
 		if result.exit {
 			return result.exitCode
 		}
@@ -412,10 +441,33 @@ func (c *client) run() int {
 			}
 			return 1
 		}
-		// Reconnects retry forever with a constant 500 ms backoff. The
-		// remote session may still be sitting there waiting (resumed
-		// laptop, lost wifi, roaming to a new network); we keep trying
-		// until the user aborts with `~.` or a real EXIT frame arrives.
+		// Reconnect-path failure. Retry-forever is meant for the
+		// "TCP couldn't connect" case (laptop just resumed, wifi
+		// dropping in and out, roaming networks). For everything
+		// else (auth changed, host key changed, xssh binary missing
+		// on the remote), looping would hide the cause.
+		//
+		// helloAcked=true means this attempt reached the daemon and
+		// died later — definitely a mid-session network blip, retry.
+		// helloAcked=false means we never got a handshake; look at
+		// ssh's own stderr to decide.
+		if !result.helloAcked && !isTransientConnectError(result.sshStderr) {
+			msg := strings.TrimSpace(result.sshStderr)
+			if msg != "" {
+				fmt.Fprintf(os.Stderr, "continuous-ssh: reconnect failed\n%s\n", msg)
+			} else {
+				fmt.Fprintln(os.Stderr, "continuous-ssh: reconnect failed")
+			}
+			// Tell the user how to reattach after fixing the
+			// underlying problem — the remote daemon is still
+			// running, only the local link refused.
+			if c.sessionID != "" {
+				fmt.Fprintf(os.Stderr,
+					"Re-attach after fixing with: xssh --session %s [ssh-args...] <target>\n",
+					c.sessionID)
+			}
+			return 137
+		}
 		dlog.V("reconnect: backing off")
 		select {
 		case <-ctx.Done():
@@ -513,6 +565,12 @@ type runResult struct {
 	// resolve hostname …", etc). Populated on every return so the
 	// caller can surface it when a first-connect attempt fails.
 	sshStderr string
+	// helloAcked is true if this attempt got at least as far as a
+	// successful HELLO_ACK decode. The reconnect loop uses this to
+	// distinguish "the daemon was reachable, but our connection died
+	// mid-session" (true → retry: just a network blip) from "we never
+	// got a handshake at all" (false → look at stderr to decide).
+	helloAcked bool
 }
 
 func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte, activate func() error) runResult {
@@ -625,6 +683,12 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		stderrWG.Wait()
 		return runResult{sshStderr: stderrBuf.String()}
 	}
+	// HELLO_ACK successfully decoded: we've completed the handshake
+	// with the remote daemon. Mark the attempt as having reached
+	// HELLO_ACK so the reconnect loop knows a later failure on this
+	// attempt is a mid-session disconnect (worth retrying), not a
+	// pre-handshake setup failure (worth surfacing).
+	helloAcked := true
 	// Protocol-version check. Major mismatch is fatal — there's no
 	// point retrying because the remote binary is what needs replacing.
 	// We surface this to the user via exit code 132 + a clear message
@@ -664,7 +728,7 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		dlog.E("activate raw mode: %v", err)
 		c.killSSH(sshCmd)
 		stderrWG.Wait()
-		return runResult{sshStderr: stderrBuf.String()}
+		return runResult{sshStderr: stderrBuf.String(), helloAcked: helloAcked}
 	}
 
 	// This session is now active. Hand it to SIGWINCH and send the initial
@@ -746,6 +810,10 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		default:
 		}
 	}
+	// Propagate helloAcked so the reconnect loop can tell apart a
+	// mid-session disconnect (retry) from a pre-handshake failure
+	// (likely surface and bail).
+	result.helloAcked = helloAcked
 	return result
 }
 
@@ -844,6 +912,26 @@ func (c *client) killSSH(cmd *exec.Cmd) {
 	}
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
+}
+
+// isTransientConnectError returns true when ssh's stderr looks like
+// a TCP-level connect failure or a DNS lookup failure — the cases
+// the reconnect-forever loop is meant to handle. OpenSSH emits very
+// specific prefixes for these:
+//
+//	"ssh: connect to host <h> port <p>: <strerror>"
+//	"ssh: Could not resolve hostname <h>: <reason>"
+//
+// Anything else (Permission denied, Host key verification failed,
+// "command not found", an empty buffer, etc.) is treated as fatal so
+// the loop surfaces it instead of hiding it behind silent retries.
+func isTransientConnectError(stderr string) bool {
+	s := strings.TrimSpace(stderr)
+	if s == "" {
+		return false
+	}
+	return strings.Contains(s, "ssh: connect to ") ||
+		strings.Contains(s, "ssh: Could not resolve hostname")
 }
 
 func (c *client) readFrames(pc *proto.Conn, exitCh chan<- int) {

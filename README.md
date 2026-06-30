@@ -292,7 +292,7 @@ $ xssh -h
 xssh — continuous-ssh: interactive SSH that survives disconnects.
 
 Usage:
-  xssh [--debug | --debug-file | --trace-file] [ssh-args...] <target>
+  xssh [flags] [ssh-args...] <target>
 
 The remote always runs your login shell. ssh-args (flags + target) are
 forwarded verbatim to the system ssh binary. On disconnect the wrapper
@@ -312,6 +312,15 @@ Flags:
                 (OUT/IN frames, every ACK sent, overlap drops). Always
                 file-only — would flood the terminal otherwise. High
                 volume: thousands of lines per session under load.
+  --session ID  reconnect to an existing session by id instead of
+                starting a new one. Useful after a previous xssh
+                invocation exited with code 137 (auth, host key, etc.):
+                the remote daemon is still running, so this flag lets
+                you reattach after fixing the underlying problem.
+                Known limitation: reattaching into a session whose
+                foreground program is in alt-screen mode (vim, htop)
+                renders into the local main screen until the program
+                quits and is restarted.
 
 Key sequences (at start of line):
   ~.   abort and exit
@@ -428,6 +437,15 @@ the session ends, so they don't accumulate).
   the client was retrying), `attach` sends EXIT(136) on the next
   reconnect so the client prints a clear "session no longer exists"
   message and exits without looping.
+- **The retry-forever loop is narrow on purpose.** It only retries
+  when the failure looks like a TCP-level transient — ssh stderr
+  matching `ssh: connect to host …` (connect refused, network
+  unreachable, timed out) or `ssh: Could not resolve hostname …`
+  (DNS blip) — OR when the attempt got as far as HELLO_ACK and
+  died mid-session (the daemon is alive; just a blip). Anything
+  else (auth failure, host key change, `xssh` binary missing on
+  the remote, etc.) surfaces ssh's own stderr and exits 1 instead
+  of looping forever silently.
 - Window-size changes (`SIGWINCH`) propagate to the remote PTY via a
   `RESIZE` frame; the initial size is sent right after `HELLO_ACK`.
 
@@ -803,6 +821,7 @@ the connection without setting up any streams.
 | `134`| Remote daemon shut itself down because the host-wide disk cap was exceeded and this session was above its fair share (typically a long disconnect with fast output). Buffer was preserved and replayed successfully. Client prints `continuous-ssh: remote daemon stopped because the host-wide disk cap was exceeded (long disconnect with fast output).` |
 | `135`| New session refused before it could start: the host-wide disk cap is already at or above DiskBudget. Client prints `continuous-ssh: cannot start new session — the host-wide disk cap is reached.` |
 | `136`| Reconnect refused: the remote session no longer exists (no daemon socket, no segments to replay — typically `xssh rm` ran while the client was retrying). Client prints `continuous-ssh: remote session no longer exists; nothing to reconnect to.` Stops the retry-forever loop. |
+| `137`| Reconnect bailed at the ssh layer with a non-transient error — typically a class that **requires user intervention** to fix: an auth rejection (load a key, fix `authorized_keys`), a host-key mismatch (update `known_hosts`), `xssh` missing on the remote (redeploy the binary that existed before the disconnect), etc. **Not fatal to the session**: the remote daemon is presumably still running. Reattach after fixing the underlying issue with `xssh --session <id> [ssh-args...] <target>` (the id is printed in the 137 message). Client prints `continuous-ssh: reconnect failed` followed by ssh's own stderr. Distinct from a plain exit 1 so scripts can tell xssh's own no-retry decision apart from other failures. |
 | other| Underlying ssh / command exit code, passed through. |
 
 ## Smoke tests

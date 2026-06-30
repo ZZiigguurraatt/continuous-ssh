@@ -43,7 +43,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `xssh — continuous-ssh: interactive SSH that survives disconnects.
 
 Usage:
-  xssh [--debug | --debug-file | --trace-file] [ssh-args...] <target>
+  xssh [flags] [ssh-args...] <target>
 
 The remote always runs your login shell. ssh-args (flags + target) are
 forwarded verbatim to the system ssh binary. On disconnect the wrapper
@@ -63,6 +63,15 @@ Flags:
                 (OUT/IN frames, every ACK sent, overlap drops). Always
                 file-only — would flood the terminal otherwise. High
                 volume: thousands of lines per session under load.
+  --session ID  reconnect to an existing session by id instead of
+                starting a new one. Useful after a previous xssh
+                invocation exited with code 137 (auth, host key, etc.):
+                the remote daemon is still running, so this flag lets
+                you reattach after fixing the underlying problem.
+                Known limitation: reattaching into a session whose
+                foreground program is in alt-screen mode (vim, htop)
+                renders into the local main screen until the program
+                quits and is restarted.
 
 Key sequences (at start of line):
   ~.   abort and exit
