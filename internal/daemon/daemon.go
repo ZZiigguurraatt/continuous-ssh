@@ -87,7 +87,7 @@ func Run(argv []string) int {
 	// before the shell starts. Sits at offset 0, becomes part of the
 	// session's scrollback like any other byte. Reconnects don't see
 	// it again — the client already has it from the first attach.
-	if banner := diskUsageBanner(); banner != "" {
+	if banner := loginBanner(sessionID); banner != "" {
 		_ = outputBuf.Append([]byte(banner))
 	}
 
@@ -518,20 +518,20 @@ func (d *daemon) statsHeartbeat(pumpDone <-chan struct{}) {
 	}
 }
 
-// diskUsageBanner returns a one-line CRLF-terminated message naming
-// the current disk-cap utilisation, written into the output stream
-// before the shell starts. Returns an empty string on any error so
-// the daemon can still come up if /proc or the home directory is
-// inaccessible.
-func diskUsageBanner() string {
+// loginBanner returns the CRLF-terminated lines written into the
+// output stream before the shell starts: the session id and the
+// current disk-cap utilization. Returns an empty string on any
+// error so the daemon can still come up if /proc or the home
+// directory is inaccessible.
+func loginBanner(sessionID string) string {
 	sess, err := sessions.List()
 	if err != nil {
-		dlog.E("disk banner: sessions.List: %v", err)
+		dlog.E("login banner: sessions.List: %v", err)
 		return ""
 	}
 	free, err := sessions.FreeDisk()
 	if err != nil {
-		dlog.E("disk banner: FreeDisk: %v", err)
+		dlog.E("login banner: FreeDisk: %v", err)
 		return ""
 	}
 	cap := sessions.DiskBudget(sess, free)
@@ -540,10 +540,12 @@ func diskUsageBanner() string {
 	if cap > 0 {
 		pct = int(float64(usage) / float64(cap) * 100)
 	}
-	return fmt.Sprintf("continuous-ssh: buffer disk usage %s of %s (%d%%)\r\n",
+	return fmt.Sprintf(
+		"continuous-ssh: session %s\r\ncontinuous-ssh: total buffer disk usage: %s (%d%%) of %s (total budget)\r\n",
+		sessionID,
 		sessions.HumanBytes(int64(usage)),
-		sessions.HumanBytes(int64(cap)),
-		pct)
+		pct,
+		sessions.HumanBytes(int64(cap)))
 }
 
 // diskCapSweep ticks every diskCapSweepInterval and triggers a

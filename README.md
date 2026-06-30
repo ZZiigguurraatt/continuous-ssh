@@ -625,16 +625,17 @@ DiskBudget) is refused up-front. The remote `attach` writes an
 EXIT 135 frame in place of HELLO_ACK; the client prints "cap
 reached" and exits without retrying.
 
-A one-line usage banner is appended to the output stream at
-session start:
+A two-line banner is appended to the output stream at session
+start — the session id and the current disk-cap utilization:
 
 ```
-continuous-ssh: buffer disk usage 21.3 MB of 1.7 GB (1%)
+continuous-ssh: session ab12cd34ef56789012ab34cd56ef7890
+continuous-ssh: total buffer disk usage: 21.3 MB (1%) of 1.7 GB (total budget)
 ```
 
-Because it's part of the session's byte stream, it lands once at
-offset 0 and isn't re-injected on reconnects (the client already
-has those bytes).
+Because the banner is part of the session's byte stream, it lands
+once at offset 0 and isn't re-injected on reconnects (the client
+already has those bytes).
 
 ### Tunable parameters
 
