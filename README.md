@@ -630,7 +630,7 @@ start — the session id and the current disk-cap utilization:
 
 ```
 continuous-ssh: session ab12cd34ef56789012ab34cd56ef7890
-continuous-ssh: total buffer disk usage: 21.3 MB (1%) of 1.7 GB (total budget)
+continuous-ssh: total buffer disk usage: 21.3 MB (1%) of 1.7 GB (DiskBudget)
 ```
 
 Because the banner is part of the session's byte stream, it lands
@@ -747,7 +747,8 @@ $ xssh ls
   98fe76dc54ba32108765edcb432109af    stale    12380     21.0 MB (  1%)  disconnected ( 5m ago)   2026-06-25 14:09 ( 5m ago)
   deadc0de87654321fedcba0987654321    dead     -        100.0 MB (  6%)  disconnected (44m ago)   2026-06-25 13:30 (44m ago)
 
-Buffer: 121.0 MB of 1.7 GB DiskBudget (7%) · Disk: 50.0 GB free of 100.0 GB (50%)
+Total buffer disk usage: 121.0 MB (  7%) of   1.7 GB (DiskBudget)
+Total disk usage:         50.0 GB ( 50%) of 100.0 GB (Total Disk)
 ```
 
 Columns:

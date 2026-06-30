@@ -541,7 +541,7 @@ func loginBanner(sessionID string) string {
 		pct = int(float64(usage) / float64(cap) * 100)
 	}
 	return fmt.Sprintf(
-		"continuous-ssh: session %s\r\ncontinuous-ssh: total buffer disk usage: %s (%d%%) of %s (total budget)\r\n",
+		"continuous-ssh: session %s\r\ncontinuous-ssh: total buffer disk usage: %s (%d%%) of %s (DiskBudget)\r\n",
 		sessionID,
 		sessions.HumanBytes(int64(usage)),
 		pct,

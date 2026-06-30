@@ -237,25 +237,32 @@ func Render(sessions []Session, w *os.File) {
 
 	// Footer (for reference): total buffer usage across all sessions,
 	// the DiskBudget those sessions evaluate against, and the
-	// filesystem's free / total capacity.
+	// filesystem's free / total capacity. Shape mirrors the
+	// daemon's login banner — `<value> (<pct>) of <total> (<descriptor>)`
+	// — so the two readouts read consistently.
 	bufferTotal := TotalDiskUsage(sessions)
-	bufPctStr := ""
+	bufPct := 0
 	if budget > 0 {
-		pct := int(float64(bufferTotal) / float64(budget) * 100)
-		bufPctStr = fmt.Sprintf(" (%d%%)", pct)
+		bufPct = int(float64(bufferTotal) / float64(budget) * 100)
 	}
-	diskPctStr := ""
+	var diskUsed uint64
+	if total > free {
+		diskUsed = total - free
+	}
+	diskPct := 0
 	if total > 0 {
-		pct := int(float64(free) / float64(total) * 100)
-		diskPctStr = fmt.Sprintf(" (%d%%)", pct)
+		diskPct = int(float64(diskUsed) / float64(total) * 100)
 	}
-	fmt.Fprintf(w, "\nBuffer: %s of %s DiskBudget%s · Disk: %s free of %s%s\n",
-		humanBytes(int64(bufferTotal)),
-		humanBytes(int64(budget)),
-		bufPctStr,
-		humanBytes(int64(free)),
-		humanBytes(int64(total)),
-		diskPctStr)
+	// Labels are padded to a common width so the value / percent /
+	// total columns line up vertically; value and total are
+	// right-justified, and percent is right-justified to three
+	// digits, matching the DISK BUF column's "%3d%%" style.
+	fmt.Fprintf(w,
+		"\n%-24s %8s (%3d%%) of %8s (DiskBudget)\n%-24s %8s (%3d%%) of %8s (Total Disk)\n",
+		"Total buffer disk usage:",
+		humanBytes(int64(bufferTotal)), bufPct, humanBytes(int64(budget)),
+		"Total disk usage:",
+		humanBytes(int64(diskUsed)), diskPct, humanBytes(int64(total)))
 }
 
 // mtimeOrZero returns the mtime of the file at path, or the zero time
