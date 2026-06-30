@@ -485,6 +485,20 @@ the session ends, so they don't accumulate).
   of looping forever silently.
 - Window-size changes (`SIGWINCH`) propagate to the remote PTY via a
   `RESIZE` frame; the initial size is sent right after `HELLO_ACK`.
+- **Wake-detect link probe.** When the laptop wakes from sleep, the
+  local TCP socket is still `ESTABLISHED` from the kernel's
+  perspective even if the link silently died during sleep (NAT entry
+  evicted, etc.). Without a probe, the user would have to type a
+  keystroke to provoke a TCP-level error and trigger reconnect. A
+  background goroutine compares the wall clock against the monotonic
+  clock once a second; if wall-time jumps forward 20 s or more
+  between ticks (the only normal cause is suspend-to-RAM), a `Ping`
+  frame is sent over the active session. If a `Pong` arrives within
+  10 s the link is healthy and nothing else happens; if the timeout
+  expires, the ssh subprocess is killed and the reconnect loop takes
+  over. Ping/Pong are sent **only** on a detected wake, never as a
+  continuous keepalive — ssh's own `ServerAliveInterval` is the
+  right knob for that.
 
 ### Output buffering & reconciliation
 
@@ -643,6 +657,8 @@ visible in one place.
 | `ackIdleMax` | **1 s** | `internal/client/client.go` | Time trigger — client emits an ACK after this long with any unacked bytes pending. Keeps low-rate streams from accumulating on the daemon. |
 | reconnect backoff | **500 ms** | `internal/client/client.go` | Wait between reconnect attempts. |
 | `keepAliveGrace` | **30 s** | `internal/daemon/daemon.go` | After client disconnect, daemon keeps its listener open this long before closing it (so a quick reconnect doesn't lose the socket). |
+| `wakeSleepThreshold` | **20 s** | `internal/client/client.go` | Wall-vs-monotonic skew that counts as a "we slept" event. Triggers the wake-detect Ping. |
+| `wakePongTimeout` | **10 s** | `internal/client/client.go` | How long the wake-detect probe waits for a Pong before declaring the link dead and force-reconnecting. |
 | SHUTDOWN drain | **2 s** | `internal/client/client.go` | After `~.`, client waits this long for ssh to deliver the SHUTDOWN frame before killing it. |
 
 ## Remote state
@@ -812,10 +828,16 @@ The one-step shortcut for the same effect is `xssh rm --kill --active`.
 
 The wire protocol carried inside the SSH transport has an explicit
 `major.minor` version exchanged in HELLO/HELLO_ACK at session start.
-Current version is **`1.1`** (see `ProtocolMajor`/`ProtocolMinor` in
-`internal/proto/frame.go`). 1.0 → 1.1 added a trailing alt-screen
-state byte to HELLO_ACK; 1.0 peers omit the byte and decoders
-default it to false.
+Current version is **`1.2`** (see `ProtocolMajor`/`ProtocolMinor` in
+`internal/proto/frame.go`). Version history:
+
+- `1.0` → `1.1` added a trailing alt-screen state byte to HELLO_ACK
+  (older peers omit it; decoders default to false).
+- `1.1` → `1.2` added `Ping` and `Pong` frame types for the
+  wake-detect liveness probe (older daemons that don't recognise
+  Ping just log "ignoring frame" and never send Pong; the client
+  treats that as a probe timeout and force-reconnects, gracefully
+  degrading to "always reconnect on wake").
 
 Compatibility rule:
 

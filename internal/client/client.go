@@ -97,6 +97,7 @@ func Run(argv []string) int {
 		outputBuf: outputBuf,
 		stdinFd:   stdinFd,
 		termOut:   &crlfTranslator{w: os.Stdout},
+		pongCh:    make(chan struct{}, 1),
 	}
 
 	// Raw mode is entered lazily on the first successful HELLO_ACK (see
@@ -345,6 +346,16 @@ type client struct {
 	// channel. Nil when no session is active.
 	currentPC atomic.Pointer[proto.Conn]
 
+	// currentSSH points at the running ssh subprocess for the current
+	// attempt. Used by the wake-detect probe path to force a fast
+	// reconnect when the link is found to be dead post-sleep.
+	currentSSH atomic.Pointer[exec.Cmd]
+
+	// pongCh signals "Pong received" from readFrames into the
+	// wake-detect probe goroutine. Buffered (size 1) so readFrames
+	// can drop a Pong non-blockingly when nobody is waiting.
+	pongCh chan struct{}
+
 	// lastOutByte is the last byte we wrote to the local terminal via an
 	// OUTPUT frame. Used by the post-exit notice path to decide whether
 	// to prepend a newline (the remote command may have ended its output
@@ -402,6 +413,7 @@ func (c *client) run() int {
 		go c.readStdinForever(ctx, stdinCh, cancel)
 		go c.watchWindowSize(ctx)
 		go c.watchAckIdle(ctx)
+		go c.watchForWake(ctx)
 		return nil
 	}
 
@@ -637,6 +649,11 @@ func (c *client) runOnce(ctx context.Context, first bool, stdinCh <-chan []byte,
 		dlog.E("ssh start: %v", err)
 		return runResult{sshStderr: err.Error()}
 	}
+	// Publish the running ssh subprocess so the wake-detect probe
+	// can kill it on Pong timeout. Cleared by the deferred store at
+	// the very end of runOnce (after the session loop returns).
+	c.currentSSH.Store(sshCmd)
+	defer c.currentSSH.Store(nil)
 	stderrWG.Add(1)
 	go func() {
 		defer stderrWG.Done()
@@ -1020,6 +1037,16 @@ func (c *client) readFrames(pc *proto.Conn, exitCh chan<- int) {
 		switch f.Type {
 		case proto.Output:
 			c.handleOutputFrame(f)
+		case proto.Pong:
+			// Reply to a wake-detect Ping. Signal the prober
+			// non-blockingly — if nobody's currently waiting
+			// (e.g. the probe already timed out and moved on),
+			// drop the Pong rather than blocking readFrames.
+			select {
+			case c.pongCh <- struct{}{}:
+			default:
+			}
+			dlog.V("PONG received")
 		case proto.Exit:
 			code := 0
 			if len(f.Payload) >= 4 {
@@ -1104,6 +1131,91 @@ func (c *client) tryAck(minBytes uint64) {
 		return
 	}
 	dlog.T("ACK sent at offset %d", total)
+}
+
+// wakeSleepThreshold is the minimum wall-clock-vs-monotonic skew that
+// counts as a "we were asleep" event. Picked above any plausible
+// scheduler jitter or NTP slew so we don't trip on those.
+//
+// wakePongTimeout is how long the client waits for the Pong reply to
+// a wake-triggered Ping before giving up on the link and force-
+// reconnecting. Generous enough to cover a slow but alive link;
+// short enough that the user notices a stalled session reasonably
+// soon after wake.
+const (
+	wakeSleepThreshold = 20 * time.Second
+	wakePongTimeout    = 10 * time.Second
+)
+
+// watchForWake watches the wall clock vs the monotonic clock and,
+// when a gap shows up (the only way that happens on a normal system
+// is suspend-to-RAM), sends a Ping probe over the active session.
+// If no Pong comes back within wakePongTimeout we assume the link
+// died during sleep and kill the ssh subprocess; the existing
+// reconnect loop then takes over.
+//
+// Cheap to run when nothing's happening: a 1 s ticker comparing two
+// timestamps and almost always doing nothing.
+func (c *client) watchForWake(ctx context.Context) {
+	var lastWall int64
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			wall := time.Now().UnixMilli()
+			if lastWall != 0 {
+				gap := time.Duration(wall-lastWall) * time.Millisecond
+				if gap >= wakeSleepThreshold {
+					dlog.E("wake detected (wall gap=%s); probing link", gap)
+					c.probeLinkOrKill()
+				}
+			}
+			lastWall = wall
+		}
+	}
+}
+
+// probeLinkOrKill sends a Ping on the current session and waits up
+// to wakePongTimeout for a Pong. On success it returns silently. On
+// timeout (or if the link's already gone) it kills the ssh
+// subprocess so the existing reconnect loop takes over.
+func (c *client) probeLinkOrKill() {
+	pc := c.currentPC.Load()
+	if pc == nil {
+		return // no active session — nothing to probe
+	}
+	// Drain any stale Pong sitting from a previous (timed-out) probe.
+	select {
+	case <-c.pongCh:
+	default:
+	}
+	if werr := pc.WriteFrame(proto.Frame{Type: proto.Ping}); werr != nil {
+		dlog.V("ping write: %v (link likely dead)", werr)
+		c.forceReconnect()
+		return
+	}
+	dlog.V("PING sent, waiting %s for PONG", wakePongTimeout)
+	select {
+	case <-c.pongCh:
+		dlog.V("link healthy across the wake")
+	case <-time.After(wakePongTimeout):
+		dlog.E("no PONG within %s; forcing reconnect", wakePongTimeout)
+		c.forceReconnect()
+	}
+}
+
+// forceReconnect kills the running ssh subprocess so readFrames /
+// runOnce return with a read error and the run loop iterates into a
+// fresh reconnect attempt.
+func (c *client) forceReconnect() {
+	cmd := c.currentSSH.Load()
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
 }
 
 // watchAckIdle wakes once per ackIdleMax and fires an ACK if any bytes

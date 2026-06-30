@@ -25,6 +25,8 @@ const (
 	Exit     FrameType = 0x07
 	Shutdown FrameType = 0x09 // client → daemon: abort, kill cmd, exit
 	Ack      FrameType = 0x0A // client → daemon: u64 offset, "I've received through this byte; you may forget anything older"
+	Ping     FrameType = 0x0B // client → daemon: liveness probe, expects Pong in reply
+	Pong     FrameType = 0x0C // daemon → client: reply to Ping
 )
 
 func (t FrameType) String() string {
@@ -45,6 +47,10 @@ func (t FrameType) String() string {
 		return "SHUTDOWN"
 	case Ack:
 		return "ACK"
+	case Ping:
+		return "PING"
+	case Pong:
+		return "PONG"
 	default:
 		return fmt.Sprintf("FrameType(0x%02x)", byte(t))
 	}
@@ -69,7 +75,7 @@ const (
 //     existing frames.
 const (
 	ProtocolMajor uint8 = 1
-	ProtocolMinor uint8 = 1
+	ProtocolMinor uint8 = 2
 )
 
 type Frame struct {

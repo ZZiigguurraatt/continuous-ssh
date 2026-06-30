@@ -966,6 +966,13 @@ func (d *daemon) readUpstream(pc *proto.Conn) {
 			ackOff := binary.BigEndian.Uint64(f.Payload[:8])
 			d.outputBuf.TrimTo(ackOff)
 			dlog.T("ACK trim to offset %d", ackOff)
+		case proto.Ping:
+			// Wake-detect liveness probe from the client. Echo a
+			// Pong with no payload; the client uses it purely as
+			// "the round-trip completed within its timeout window."
+			if werr := pc.WriteFrame(proto.Frame{Type: proto.Pong}); werr != nil {
+				dlog.V("pong write: %v", werr)
+			}
 		default:
 			dlog.V("ignoring frame %s from attach", f.Type)
 		}
