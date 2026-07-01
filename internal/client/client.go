@@ -909,15 +909,27 @@ func (c *client) makeSSHCmd(first bool) *exec.Cmd {
 		termValue = "xterm-256color"
 	}
 
-	// Prepend the common user-install locations to PATH so the remote shell
-	// finds `xssh` whether it was installed system-wide
-	// (`/usr/local/bin/`) or in any of the user-local spots: `~/bin/`,
-	// `~/.local/bin/`, or `~/go/bin/` (where `go install` drops things).
-	// $HOME and $PATH are intentionally left unquoted here so the remote
-	// shell expands them; the value of TERM is shellQuote'd, the literal
-	// path additions are not.
+	// Prepend the common user-install locations to PATH so the remote
+	// shell finds `xssh` whether it was installed system-wide
+	// (`/usr/local/bin/`) or in any of the user-local spots. The static
+	// list is `~/bin/`, `~/.local/bin/`, `~/go/bin/`. On top of that,
+	// if the remote has Go installed, dynamically append its effective
+	// bindir (`go env GOBIN`, or `$(go env GOPATH)/bin` when GOBIN is
+	// unset) — matches the Makefile's `do_deploy` probe so a binary
+	// pushed by the auto-install feature can be found on the next
+	// connect even when the user has a custom GOBIN/GOPATH.
+	//
+	// $PATH / $HOME / the $(…) command-sub are all expanded by the
+	// remote shell at command-line parse time, before it runs xssh.
+	// Nothing is shellQuoted here; the whole value stays inside "..."
+	// so any spaces from unusual $HOME or go env output don't break
+	// the assignment.
+	pathToken := `PATH="$PATH:$HOME/bin:$HOME/.local/bin:$HOME/go/bin` +
+		`$(command -v go >/dev/null 2>&1 && ` +
+		`{ g=$(go env GOBIN); g=${g:-$(go env GOPATH)/bin}; ` +
+		`printf ':%s' "$g"; })"`
 	tokens := []string{
-		`PATH=$PATH:$HOME/bin:$HOME/.local/bin:$HOME/go/bin`,
+		pathToken,
 		"TERM=" + shellQuote(termValue),
 		shellQuote("xssh"),
 		shellQuote("attach"),

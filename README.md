@@ -275,15 +275,20 @@ subcommand. After a `make deploy*`, also `make install-user` (or
 The local client invokes the remote binary by name (`xssh attach …`)
 and **prepends a handful of common install locations to the remote
 `PATH`** before running it, so the remote shell finds `xssh` whether
-it was installed system-wide or user-local:
+it was installed system-wide or user-local. The static list is
+`~/bin/`, `~/.local/bin/`, `~/go/bin/`. On top of that, if the
+remote has Go installed the client dynamically appends its effective
+Go bindir — `go env GOBIN`, or `$(go env GOPATH)/bin` when GOBIN is
+unset — so a binary placed at a custom GOBIN or non-default GOPATH
+by the auto-install feature (or `make deploy`) is still discoverable:
 
 ```
-PATH=$PATH:$HOME/bin:$HOME/.local/bin:$HOME/go/bin xssh attach …
+PATH="$PATH:$HOME/bin:$HOME/.local/bin:$HOME/go/bin$(command -v go >/dev/null 2>&1 && { g=$(go env GOBIN); g=${g:-$(go env GOPATH)/bin}; printf ':%s' "$g"; })" xssh attach …
 ```
 
-So you don't have to add `~/bin/` (or `~/go/bin/`) to the remote
-account's shell rc just to make `xssh` discoverable when sshd starts a
-non-login shell.
+So you don't have to add `~/bin/` (or `~/go/bin/`, or your custom
+GOBIN) to the remote account's shell rc just to make `xssh`
+discoverable when sshd starts a non-login shell.
 
 ## Usage
 
