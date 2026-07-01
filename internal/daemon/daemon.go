@@ -820,6 +820,20 @@ func (d *daemon) serveAttach(conn net.Conn) {
 	go func() {
 		defer stdinWG.Done()
 		d.readUpstream(pc)
+		// readUpstream returned — the client-side attach closed
+		// the unix socket. Nothing else broadcasts cond in this
+		// case (no new attach, no shell exit, no shutdown), so
+		// without this signal the main select below would sit in
+		// cond.Wait() forever, keeping the accepted socket FD
+		// open and making `xssh ls` misreport the session as
+		// still-connected. Bump epoch so the main select falls
+		// into the "superseded" branch and cleans up properly.
+		d.mu.Lock()
+		if d.activeConn == conn {
+			d.epoch++
+		}
+		d.cond.Broadcast()
+		d.mu.Unlock()
 	}()
 
 	d.mu.Lock()
