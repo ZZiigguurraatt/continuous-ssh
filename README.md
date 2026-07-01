@@ -92,6 +92,200 @@ network changes rather than needing to be re-established by this tool.
   the MOTD, read it some other way (e.g. `cat /etc/motd` / `cat
   /run/motd.dynamic` once connected).
 
+## Architecture
+
+Five processes are involved in a live session — two on the local
+host, three on the remote:
+
+```
+                     local host (laptop)
+             +---------------------------------+
+             |          your terminal          |
+             +----------------+----------------+
+                              ^
+                              |  raw stdio  (client puts the tty
+                              v              in raw mode after HELLO_ACK)
+             +---------------------------------+
+             |           xssh client           |   one per xssh invocation
+             +----------------+----------------+
+                              ^
+                              |  stdio pipes
+                              v
+             +---------------------------------+
+             |          ssh (system)           |   fork+exec'd by the client
+             +----------------+----------------+
+                              ^
+                              |  network
+     - - - - - - - - - - - - -+- - - - - - - - - - - - - - - - - -
+                              v
+                     remote host
+             +---------------------------------+
+             |              sshd               |   unmodified; fork+execs
+             +----------------+----------------+   the remote command
+                              ^
+                              |  stdio pipes
+                              v
+             +---------------------------------+
+             |           xssh attach           |   per-connection;
+             |  (fork+execs the daemon on the  |   short-lived
+             |   first connect; just dials it  |
+             |   thereafter)                   |
+             +----------------+----------------+
+                              ^
+                              |  unix socket
+                              |  ~/.continuous-ssh/sessions/<id>/sock
+                              v
+             +---------------------------------+
+             |           xssh daemon           |   long-lived;
+             |  - owns the PTY master          |   one per session-id;
+             |  - runs the login shell in PTY  |   outlives attach
+             |  - keeps output history buffer  |   across reconnects
+             |    (RAM tail + disk spill)      |
+             +----------------+----------------+
+                              ^
+                              |  PTY
+                              v
+             +---------------------------------+
+             |    login shell (bash, ...)      |   keeps running whether
+             +---------------------------------+   or not you're connected
+```
+
+Lifetimes and process relationships:
+
+- **`xssh client`** — the local invocation. One per `xssh` command;
+  exits when the remote shell exits (or you hit `~.`).
+- **`ssh` (system binary)** — `fork+exec`'d by the client with
+  `ssh -T ... xssh attach ...`. Standard `~/.ssh/config` applies
+  (aliases, keys, `ProxyJump`, agent, etc.); we're just piggybacking
+  on its transport.
+- **`sshd`** — remote SSH daemon, unmodified. Accepts the connection
+  and `fork+exec`'s the remote command from the ssh args.
+- **`xssh attach`** — the remote command. Short-lived: one process
+  per client connection. Its job is to dial the daemon's unix
+  socket and bridge its own stdio (which is the ssh pipe) to the
+  socket. On the very first connect for a session-id, it also
+  `fork+exec`'s a fresh daemon in the background; on subsequent
+  reconnects it just re-attaches to the already-running daemon.
+- **`xssh daemon`** — the long-lived process that owns the login
+  shell's PTY master and the output history buffer. Listens on
+  `~/.continuous-ssh/sessions/<id>/sock`. Serves at most one
+  attach at a time (a new attach kicks the previous one).
+- **login shell** — `bash` / `zsh` / etc., spawned by the daemon
+  attached to the PTY. Runs as if it were an interactive local
+  shell; unaware of the wrapper.
+
+Proto frames (`Hello` / `HelloAck` / `Output` / `Ack` / `Resize` /
+`Ping` / `Pong` / `Shutdown` / `Exit` / ...) travel end-to-end
+between `xssh client` and `xssh daemon`. The intermediate stdio
+pipes + ssh transport + unix socket are all transparent byte pipes;
+the framing lives on top and doesn't care about the layers below.
+On reconnect a fresh `xssh attach` bridges to the same daemon, and
+the client and daemon reconcile via SHA-256 chunk manifests (see
+"Output buffering & reconciliation" below).
+
+### Reconnect
+
+The topology on reconnect matches the live-session diagram — no
+new picture needed — but knowing which layers turn over vs.
+persist is the whole point of the wrapper:
+
+- **`xssh client`** — persists; its retry-forever loop drives the
+  reconnect.
+- **`ssh` (system)** — died with the link; the client `fork+exec`'s
+  a fresh one after a 500 ms backoff (or immediately, on a
+  wake-probe timeout).
+- **`sshd`** — unmodified; accepts the new TCP and `fork+exec`'s
+  a new `attach`.
+- **`xssh attach`** — a fresh process per connection. Displaces the
+  previous attach at the daemon's socket (the daemon serves at
+  most one).
+- **`xssh daemon`** — persists throughout, buffering output into
+  RAM + disk spill while the link is down.
+- **login shell** — persists; oblivious to the gap.
+
+On the wire the new attach's `HELLO` carries the client's chunk
+manifest; the daemon uses it to figure out exactly which bytes to
+retransmit. Full mechanics in "Output buffering & reconciliation"
+below.
+
+### Recovery: the replay daemon
+
+If a reconnect finds the session's unix socket gone (host reboot,
+`kill -9`, OOM, etc.) but the on-disk segment files still present,
+`xssh attach` `fork+exec`'s a **replay daemon** — the same `xssh`
+binary invoked as `xssh daemon --session <id> --replay` — and
+bridges to that instead. The client and everything above `attach`
+is identical to the live case; only the bottom of the chain
+changes:
+
+```
+                     local host (laptop)
+             +---------------------------------+
+             |          your terminal          |
+             +----------------+----------------+
+                              ^
+                              |  raw stdio
+                              v
+             +---------------------------------+
+             |           xssh client           |
+             +----------------+----------------+
+                              ^
+                              |  stdio pipes
+                              v
+             +---------------------------------+
+             |          ssh (system)           |
+             +----------------+----------------+
+                              ^
+                              |  network
+     - - - - - - - - - - - - -+- - - - - - - - - - - - - - - - - -
+                              v
+                     remote host
+             +---------------------------------+
+             |              sshd               |
+             +----------------+----------------+
+                              ^
+                              |  stdio pipes
+                              v
+             +---------------------------------+
+             |           xssh attach           |
+             |   1. dial sock -> fails         |
+             |   2. see output.log.<off> segs  |
+             |      on disk                    |
+             |   3. fork+exec replay daemon    |
+             |   4. re-dial the sock           |
+             +----------------+----------------+
+                              ^
+                              |  unix socket
+                              v
+             +---------------------------------+
+             |     xssh daemon --replay        |   one-shot;
+             |  - no PTY, no shell             |   serves one attach
+             |  - reads segments straight      |   then exits
+             |    from disk (see below)        |
+             |  - sends EXIT(133) on success,  |
+             |    EXIT(134) if a diskcap       |
+             |    marker was found alongside   |
+             |    the clean marker             |
+             |  - removes the session dir on   |
+             |    the way out                  |
+             +----------------+----------------+
+                              ^
+                              |  reads
+                              v
+             +---------------------------------+
+             |   on-disk session directory     |
+             |   ~/.continuous-ssh/sessions/   |
+             |                          <id>/  |
+             |    output.log.<off>  (segments) |
+             |    clean             (required) |
+             |    diskcap           (optional) |
+             +---------------------------------+
+```
+
+See "Recovery / replay" below for the refusal path (missing
+`clean` marker) and exit-code semantics. `xssh ls` reports the
+session as `replay` while a replay daemon is running.
+
 ## Build & install
 
 ### Build dependencies (Ubuntu)
