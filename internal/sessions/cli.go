@@ -118,14 +118,14 @@ func disposeAll(sessions []Session, verb string, fn func(Session) error) int {
 		switch verb {
 		case "kill":
 			switch s.Status {
-			case StatusActive, StatusCatchup, StatusStalled, StatusReplay, StatusStale:
+			case StatusActive, StatusIdle, StatusCatchup, StatusStalled, StatusReplay, StatusStale:
 				fmt.Fprintf(os.Stdout, "%s: signaled %s session (pid %d)\n", s.ID, s.Status, s.Pid)
 			case StatusDead:
 				fmt.Fprintf(os.Stdout, "%s: removed dead session directory\n", s.ID)
 			}
 		case "rm":
 			switch s.Status {
-			case StatusActive, StatusCatchup, StatusStalled, StatusReplay, StatusStale:
+			case StatusActive, StatusIdle, StatusCatchup, StatusStalled, StatusReplay, StatusStale:
 				fmt.Fprintf(os.Stdout, "%s: terminated and removed (was %s, pid %d)\n", s.ID, s.Status, s.Pid)
 			case StatusDead:
 				fmt.Fprintf(os.Stdout, "%s: removed dead session directory\n", s.ID)
@@ -166,10 +166,10 @@ func applyFilter(in []Session, f filter) []Session {
 	var out []Session
 	for _, s := range in {
 		switch s.Status {
-		case StatusActive, StatusCatchup, StatusStalled, StatusReplay:
-			// All four of these have a live attach — group
-			// them under the --active filter rather than
-			// needing dedicated flags for transient variants.
+		case StatusActive, StatusIdle, StatusCatchup, StatusStalled, StatusReplay:
+			// All of these have a live attach — group them
+			// under the --active filter rather than needing
+			// dedicated flags for transient variants.
 			if f.active {
 				out = append(out, s)
 			}

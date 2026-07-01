@@ -20,9 +20,10 @@ type Status int
 
 const (
 	StatusUnknown Status = iota
-	StatusActive         // daemon alive, client currently connected
+	StatusActive         // daemon alive, client currently connected, output flowing
+	StatusIdle           // daemon alive, client connected, no output for > idleNoOutputThreshold (e.g. bash at a prompt)
 	StatusCatchup        // daemon alive, unacked backlog above threshold — reconnect catch-up or chronic backpressure
-	StatusStalled        // daemon alive, no ACK from current attach for > stalledNoAckThreshold — usually a dead peer whose socket the OS hasn't yet torn down
+	StatusStalled        // daemon alive, pending data but no ACK from current attach for > stalledNoAckThreshold — usually a dead peer whose socket the OS hasn't yet torn down
 	StatusReplay         // replay daemon serving preserved segments to a reattaching client
 	StatusStale          // daemon alive, no client (waiting for reconnect)
 	StatusDead           // session dir present, no daemon process
@@ -32,6 +33,8 @@ func (s Status) String() string {
 	switch s {
 	case StatusActive:
 		return "active"
+	case StatusIdle:
+		return "idle"
 	case StatusCatchup:
 		return "catchup"
 	case StatusStalled:
@@ -96,16 +99,19 @@ func List() ([]Session, error) {
 			s.Status = StatusDead
 		case connected[filepath.Join(s.Dir, "sock")]:
 			// Live daemon with a connected client. Refine into
-			// one of `replay`, `stalled`, `catchup`, or plain
-			// `active`, in that precedence order:
+			// one of `replay`, `stalled`, `catchup`, `idle`,
+			// or plain `active`, in that precedence order:
 			//   - replay:  process cmdline has `--replay` — this
 			//              is the short-lived replay daemon
 			//              serving preserved segments.
 			//   - stalled: daemon wrote the `stalled` marker
-			//              (no ACK from current attach in
+			//              (pending data but no ACK from
+			//              current attach in
 			//              stalledNoAckThreshold).
 			//   - catchup: daemon wrote the `catchup` marker
 			//              (unacked backlog above threshold).
+			//   - idle:    daemon wrote the `idle` marker
+			//              (no output for idleNoOutputThreshold).
 			//   - active:  none of the above.
 			switch {
 			case isReplayDaemon(s.Pid):
@@ -114,6 +120,8 @@ func List() ([]Session, error) {
 				s.Status = StatusStalled
 			case fileExists(filepath.Join(s.Dir, "catchup")):
 				s.Status = StatusCatchup
+			case fileExists(filepath.Join(s.Dir, "idle")):
+				s.Status = StatusIdle
 			default:
 				s.Status = StatusActive
 			}
@@ -264,7 +272,7 @@ func Render(sessions []Session, w *os.File) {
 		if !s.LastAttach.IsZero() {
 			ago := humanDur(now.Sub(s.LastAttach))
 			verb := "connected"
-			if s.Status != StatusActive && s.Status != StatusCatchup && s.Status != StatusStalled && s.Status != StatusReplay {
+			if s.Status != StatusActive && s.Status != StatusIdle && s.Status != StatusCatchup && s.Status != StatusStalled && s.Status != StatusReplay {
 				verb = "disconnected"
 			}
 			// Verb padded to "disconnected" width; the time portion
@@ -411,7 +419,7 @@ func humanDur(d time.Duration) string {
 // For a Dead session the on-disk directory is unlinked directly.
 func Kill(s Session) error {
 	switch s.Status {
-	case StatusActive, StatusCatchup, StatusStalled, StatusReplay, StatusStale:
+	case StatusActive, StatusIdle, StatusCatchup, StatusStalled, StatusReplay, StatusStale:
 		if err := syscall.Kill(s.Pid, syscall.SIGTERM); err != nil {
 			return fmt.Errorf("signal pid %d: %w", s.Pid, err)
 		}
@@ -441,7 +449,7 @@ func Rm(s Session, kill bool) error {
 			return fmt.Errorf("remove %s: %w", s.Dir, err)
 		}
 		return nil
-	case StatusActive, StatusCatchup, StatusStalled, StatusReplay, StatusStale:
+	case StatusActive, StatusIdle, StatusCatchup, StatusStalled, StatusReplay, StatusStale:
 		if !kill {
 			return fmt.Errorf("session is %s (live daemon); pass --kill to terminate it first, or `xssh kill` it manually", s.Status)
 		}
