@@ -427,7 +427,6 @@ func (c *client) run() int {
 			c.aborted = true
 			return 130
 		}
-		first := !haveHelloAcked
 		// runOnce uses "this attempt is a fresh-new-session creation"
 		// to decide between --new and --session for the remote attach;
 		// that's distinct from "is this the first attempt of the
@@ -447,7 +446,14 @@ func (c *client) run() int {
 		// reconnect to, and silently re-attempting would mask real
 		// problems (wrong host, ssh auth failure, remote xssh binary
 		// missing). Surface ssh's own diagnostic and exit.
-		if first {
+		//
+		// Read `haveHelloAcked` here (AFTER the update above), not a
+		// snapshot taken before runOnce ran: an attempt that completes
+		// HELLO_ACK and then dies mid-session on the very first
+		// iteration is a reconnect scenario, not a first-connect
+		// failure. A stale pre-iteration snapshot would misroute it
+		// into the bail-with-"initial connection failed" branch.
+		if !haveHelloAcked {
 			msg := strings.TrimSpace(result.sshStderr)
 			// Remote `xssh` missing on PATH: offer to push the
 			// local binary up before bailing. On success we loop
