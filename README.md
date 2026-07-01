@@ -782,11 +782,14 @@ Columns:
 
 Statuses:
 
-| Status   | Daemon process | Client connected | Meaning |
-|----------|----------------|------------------|---------|
-| `active` | running        | yes              | A client is currently attached and exchanging frames. |
-| `stale`  | running        | no               | Daemon is idle, waiting for a reconnect (the keep-alive grace). |
-| `dead`   | gone           | n/a              | Session directory persists but the daemon process is no longer around. Eligible for replay-on-reconnect if a `clean` marker is present. |
+| Status    | Daemon process | Client connected | Meaning |
+|-----------|----------------|------------------|---------|
+| `active`  | running        | yes              | A client is currently attached and exchanging frames. |
+| `catchup` | running        | yes              | Daemon has a meaningful unacked backlog — either draining a reconnect gap (transient) or in chronic backpressure because the producer is outpacing the link (persistent). Hysteresis: enters when held bytes cross above 2 MiB, exits only when they drop below 1 MiB. Independent of ACK activity; a fast-producer session with normal ACK flow can stay in `catchup` for as long as the backlog persists. |
+| `stalled` | running        | yes              | No ACK from the current attach for ≥30 s. The client's `ackIdleMax` of 1 s means ACKs normally flow continuously during output, so any 30-s silence is abnormal — typically a peer that's gone quiet on a socket the OS hasn't yet torn down. Takes precedence over `catchup` when both would apply. Cleared on any incoming ACK. |
+| `replay`  | running (as replay daemon) | yes | Original daemon is gone; a replay daemon (spawned by `attach` for a reconnecting client) is currently streaming preserved segments. Transient — usually disappears within seconds of the client finishing the replay. |
+| `stale`   | running        | no               | Daemon is idle, waiting for a reconnect. |
+| `dead`    | gone           | n/a              | Session directory persists but the daemon process is no longer around. Eligible for replay-on-reconnect if a `clean` marker is present. |
 
 Filters: `--active`, `--stale`, `--dead`, or `--all` (default). Combine
 freely (e.g. `xssh ls --active --stale`).

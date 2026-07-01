@@ -21,6 +21,9 @@ type Status int
 const (
 	StatusUnknown Status = iota
 	StatusActive         // daemon alive, client currently connected
+	StatusCatchup        // daemon alive, unacked backlog above threshold — reconnect catch-up or chronic backpressure
+	StatusStalled        // daemon alive, no ACK from current attach for > stalledNoAckThreshold — usually a dead peer whose socket the OS hasn't yet torn down
+	StatusReplay         // replay daemon serving preserved segments to a reattaching client
 	StatusStale          // daemon alive, no client (waiting for reconnect)
 	StatusDead           // session dir present, no daemon process
 )
@@ -29,6 +32,12 @@ func (s Status) String() string {
 	switch s {
 	case StatusActive:
 		return "active"
+	case StatusCatchup:
+		return "catchup"
+	case StatusStalled:
+		return "stalled"
+	case StatusReplay:
+		return "replay"
 	case StatusStale:
 		return "stale"
 	case StatusDead:
@@ -86,7 +95,28 @@ func List() ([]Session, error) {
 		case !alive:
 			s.Status = StatusDead
 		case connected[filepath.Join(s.Dir, "sock")]:
-			s.Status = StatusActive
+			// Live daemon with a connected client. Refine into
+			// one of `replay`, `stalled`, `catchup`, or plain
+			// `active`, in that precedence order:
+			//   - replay:  process cmdline has `--replay` — this
+			//              is the short-lived replay daemon
+			//              serving preserved segments.
+			//   - stalled: daemon wrote the `stalled` marker
+			//              (no ACK from current attach in
+			//              stalledNoAckThreshold).
+			//   - catchup: daemon wrote the `catchup` marker
+			//              (unacked backlog above threshold).
+			//   - active:  none of the above.
+			switch {
+			case isReplayDaemon(s.Pid):
+				s.Status = StatusReplay
+			case fileExists(filepath.Join(s.Dir, "stalled")):
+				s.Status = StatusStalled
+			case fileExists(filepath.Join(s.Dir, "catchup")):
+				s.Status = StatusCatchup
+			default:
+				s.Status = StatusActive
+			}
 		default:
 			s.Status = StatusStale
 		}
@@ -111,6 +141,35 @@ func List() ([]Session, error) {
 		}
 	}
 	return out, nil
+}
+
+// fileExists returns true if the given path exists (regardless of
+// type). Used to check for marker files like "catchup" and "clean".
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// isReplayDaemon reports whether the process at `pid` is an xssh
+// daemon running in --replay mode, detected by inspecting
+// /proc/<pid>/cmdline. Returns false on non-Linux or if the
+// cmdline can't be read (in which case we fall through to
+// treating the session as normally "active").
+func isReplayDaemon(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	// cmdline is null-separated; scan for the --replay arg.
+	for _, arg := range strings.Split(string(data), "\x00") {
+		if arg == "--replay" {
+			return true
+		}
+	}
+	return false
 }
 
 func readPid(dir string) int {
@@ -205,7 +264,7 @@ func Render(sessions []Session, w *os.File) {
 		if !s.LastAttach.IsZero() {
 			ago := humanDur(now.Sub(s.LastAttach))
 			verb := "connected"
-			if s.Status != StatusActive {
+			if s.Status != StatusActive && s.Status != StatusCatchup && s.Status != StatusStalled && s.Status != StatusReplay {
 				verb = "disconnected"
 			}
 			// Verb padded to "disconnected" width; the time portion
@@ -352,7 +411,7 @@ func humanDur(d time.Duration) string {
 // For a Dead session the on-disk directory is unlinked directly.
 func Kill(s Session) error {
 	switch s.Status {
-	case StatusActive, StatusStale:
+	case StatusActive, StatusCatchup, StatusStalled, StatusReplay, StatusStale:
 		if err := syscall.Kill(s.Pid, syscall.SIGTERM); err != nil {
 			return fmt.Errorf("signal pid %d: %w", s.Pid, err)
 		}
@@ -382,7 +441,7 @@ func Rm(s Session, kill bool) error {
 			return fmt.Errorf("remove %s: %w", s.Dir, err)
 		}
 		return nil
-	case StatusActive, StatusStale:
+	case StatusActive, StatusCatchup, StatusStalled, StatusReplay, StatusStale:
 		if !kill {
 			return fmt.Errorf("session is %s (live daemon); pass --kill to terminate it first, or `xssh kill` it manually", s.Status)
 		}

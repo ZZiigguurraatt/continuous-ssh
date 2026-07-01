@@ -204,6 +204,15 @@ func Run(argv []string) int {
 		d.diskCapSweep(pumpDone)
 	}()
 
+	// Catchup-marker checker. Ticks 1×/sec, writes/removes the
+	// "catchup" marker file when a live attach has meaningful
+	// unacked backlog and hasn't ACKed for a while.
+	catchupDone := make(chan struct{})
+	go func() {
+		defer close(catchupDone)
+		d.catchupCheck(pumpDone)
+	}()
+
 	d.acceptLoop(listener)
 
 	d.killCmd(cmd)
@@ -412,12 +421,49 @@ type daemon struct {
 	exitDelivered  bool
 
 	attachesWG sync.WaitGroup
+
+	// Health-marker tracking. Updated by readUpstream on each ACK
+	// (bumps lastAckMs, clears stalled marker) and by the
+	// serveAttach entry (resets lastAckMs and both markers for the
+	// new attach). Read by catchupCheck to write/remove the marker
+	// files. atomic to avoid pulling d.mu into the ACK hot path.
+	lastAckMs        atomic.Int64
+	catchupMarkerSet atomic.Bool
+	stalledMarkerSet atomic.Bool
 }
 
 // cleanMarkerName is the file written under the session directory when the
 // daemon shuts down cleanly with its RAM tail successfully flushed to
 // disk. The replay daemon refuses to serve a session that lacks it.
 const cleanMarkerName = "clean"
+
+// Health-marker files that `xssh ls` reads to report richer status
+// than plain `active` when the daemon has a live attach but something
+// is worth flagging. The daemon's catchupCheck goroutine evaluates
+// these on a 1-Hz tick.
+//
+// `catchup` — unacked backlog exceeds the enter threshold. Uses
+// hysteresis (enter at 2 MiB, exit at 1 MiB) so a fast-producer
+// session whose held-bytes hover near the threshold doesn't cause
+// rapid marker flapping: once entered, we stay in catchup until the
+// backlog drops below the exit threshold.
+//
+// `stalled` — no ACK has arrived from the current attach for
+// stalledNoAckThreshold. That's well past the client's ackIdleMax
+// (=1s during active output), so any 30-s silence is abnormal.
+// Usually indicates a dead peer whose socket the OS hasn't yet torn
+// down. `stalled` takes precedence over `catchup` when both apply.
+//
+// Stalled is cleared on any incoming ACK (no hysteresis needed —
+// time-based conditions don't oscillate). Catchup follows the
+// hysteresis rule described above.
+const (
+	catchupMarkerName            = "catchup"
+	stalledMarkerName            = "stalled"
+	catchupUnackedEnterThreshold = 2 << 20 // 2 MiB — cross above to enter
+	catchupUnackedExitThreshold  = 1 << 20 // 1 MiB — must drop below to exit
+	stalledNoAckThreshold        = 30 * time.Second
+)
 
 // diskcapMarkerName is written next to the clean marker when the
 // daemon shut down because the host-wide disk cap was exceeded
@@ -546,6 +592,110 @@ func loginBanner(sessionID string) string {
 		sessions.HumanBytes(int64(usage)),
 		pct,
 		sessions.HumanBytes(int64(cap)))
+}
+
+// catchupCheck ticks 1x/sec and manages the `catchup` and `stalled`
+// marker files: catchup on held-bytes > threshold, stalled on
+// no-ACK-in-a-while. Stops with the pump.
+func (d *daemon) catchupCheck(pumpDone <-chan struct{}) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-pumpDone:
+			// Best-effort cleanup on the way out.
+			d.removeCatchupMarker()
+			d.removeStalledMarker()
+			return
+		case <-t.C:
+			d.evaluateHealthMarkers()
+		}
+	}
+}
+
+// evaluateHealthMarkers applies both marker predicates. Called on
+// each 1s tick and cheap enough that the granularity is fine.
+// Stalled takes precedence over catchup when both would apply — a
+// stalled peer is more actionable info than a growing backlog.
+func (d *daemon) evaluateHealthMarkers() {
+	d.mu.Lock()
+	hasActive := d.activeConn != nil
+	d.mu.Unlock()
+	if !hasActive {
+		// No client — status is "stale", not one of the live
+		// warning states. Clear both markers.
+		d.removeCatchupMarker()
+		d.removeStalledMarker()
+		return
+	}
+	sinceLastAck := time.Since(time.UnixMilli(d.lastAckMs.Load()))
+	if sinceLastAck > stalledNoAckThreshold {
+		d.writeStalledMarker()
+		d.removeCatchupMarker()
+		return
+	}
+	d.removeStalledMarker()
+	held := d.outputBuf.Stats().HeldBytes
+	// Hysteresis: once we're in catchup, stay in it until backlog
+	// drops below the exit threshold. Otherwise a session hovering
+	// at ~4 MiB (e.g. a fast producer + fast link at steady state)
+	// would flap the marker on and off every tick.
+	if d.catchupMarkerSet.Load() {
+		if held < catchupUnackedExitThreshold {
+			d.removeCatchupMarker()
+		}
+	} else {
+		if held > catchupUnackedEnterThreshold {
+			d.writeCatchupMarker()
+		}
+	}
+}
+
+// writeCatchupMarker / removeCatchupMarker manage the "catchup"
+// marker file. The atomic bool guards let the fast path skip the
+// syscall when the state hasn't changed.
+func (d *daemon) writeCatchupMarker() {
+	if d.catchupMarkerSet.Swap(true) {
+		return
+	}
+	path := filepath.Join(d.sessionDir, catchupMarkerName)
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		dlog.V("catchup marker write: %v", err)
+		d.catchupMarkerSet.Store(false)
+	}
+}
+
+func (d *daemon) removeCatchupMarker() {
+	if !d.catchupMarkerSet.Swap(false) {
+		return
+	}
+	path := filepath.Join(d.sessionDir, catchupMarkerName)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		dlog.V("catchup marker remove: %v", err)
+	}
+}
+
+// writeStalledMarker / removeStalledMarker manage the "stalled"
+// marker file, following the same pattern as their catchup twins.
+func (d *daemon) writeStalledMarker() {
+	if d.stalledMarkerSet.Swap(true) {
+		return
+	}
+	path := filepath.Join(d.sessionDir, stalledMarkerName)
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		dlog.V("stalled marker write: %v", err)
+		d.stalledMarkerSet.Store(false)
+	}
+}
+
+func (d *daemon) removeStalledMarker() {
+	if !d.stalledMarkerSet.Swap(false) {
+		return
+	}
+	path := filepath.Join(d.sessionDir, stalledMarkerName)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		dlog.V("stalled marker remove: %v", err)
+	}
 }
 
 // diskCapSweep ticks every diskCapSweepInterval and triggers a
@@ -803,6 +953,13 @@ func (d *daemon) serveAttach(conn net.Conn) {
 	d.touchKeepAlive()
 	d.cond.Broadcast()
 	d.mu.Unlock()
+	// Reset per-attach health-marker state: give the new attach a
+	// fresh 30 s of "not stalled" grace, and clear any residual
+	// marker files from the previous attach (their state doesn't
+	// carry over to the new one).
+	d.lastAckMs.Store(time.Now().UnixMilli())
+	d.removeCatchupMarker()
+	d.removeStalledMarker()
 	dlog.V("attach epoch=%d resendFrom=%d daemonTotal=%d",
 		epoch, resendFrom, outputMan.Total)
 
@@ -981,6 +1138,14 @@ func (d *daemon) readUpstream(pc *proto.Conn) {
 			}
 			ackOff := binary.BigEndian.Uint64(f.Payload[:8])
 			d.outputBuf.TrimTo(ackOff)
+			// Bump the last-ACK timestamp for the stalled-marker
+			// check and clear the stalled marker immediately if
+			// it was set. The catchup marker isn't touched here —
+			// it's a size-based signal, and evaluateHealthMarkers
+			// will drop it on its own once the trim brings held
+			// bytes below the exit threshold.
+			d.lastAckMs.Store(time.Now().UnixMilli())
+			d.removeStalledMarker()
 			dlog.T("ACK trim to offset %d", ackOff)
 		case proto.Ping:
 			// Wake-detect liveness probe from the client. Echo a
